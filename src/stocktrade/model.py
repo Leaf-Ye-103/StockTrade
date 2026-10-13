@@ -1,62 +1,55 @@
-"""Small, causal multimodal self-supervised model for research.
+"""Causal multi-asset action policy trained from historical evaluator feedback.
 
-No human buy/sell labels are used. A Gaussian next-observation objective and
-causal masked reconstruction learn representations. A separate trainable
-allocator maximizes a constrained one-step forecast utility. This is an
-initial model, not evidence of profitable trading or calibrated uncertainty.
+The actor emits HOLD or a symbol, side and monetary budget. There is no price,
+return, reconstructed-input or allocation-forecast training objective. The only
+loss is a policy gradient from observed evaluator feedback and an exploration
+regularizer. A running historical reward mean supplies a non-neural baseline.
 """
 
-from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
 import math
 
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.distributions import Categorical
 
-from .risk import Forecast
+from .policy_contracts import PortfolioState, TradingAction
 from .schemas import FeatureFrame
 
 
 @dataclass(frozen=True)
-class TrainingConfig:
+class PolicyConfig:
     lookback: int = 16
     hidden_dim: int = 32
-    epochs: int = 3
-    batch_size: int = 32
+    budget_fractions: tuple[float, ...] = (0.01, 0.05, 0.10, 0.20)
     learning_rate: float = 0.001
-    mask_probability: float = 0.15
-    reconstruction_weight: float = 0.25
-    allocation_weight: float = 1.0
-    risk_aversion: float = 10.0
-    tail_aversion: float = 1.0
-    transaction_cost_bps: float = 5.0
-    max_allocation: float = 0.20
+    entropy_weight: float = 0.0001
+    normalize_advantages: bool = True
+    advantage_scale_floor: float = 0.001
+    gradient_clip: float = 1.0
     seed: int = 7
     num_threads: int = 1
 
     def __post_init__(self) -> None:
-        if self.lookback < 2 or min(self.hidden_dim, self.epochs, self.batch_size, self.num_threads) < 1:
-            raise ValueError("Lookback must be >= 2; dimensions, epochs, batches and threads positive")
-        if not 0 < self.mask_probability < 1 or not 0 < self.max_allocation <= 1:
-            raise ValueError("Mask probability and maximum allocation must lie in (0,1]")
-        positive = (self.learning_rate,)
-        nonnegative = (
-            self.reconstruction_weight, self.allocation_weight,
-            self.risk_aversion, self.tail_aversion, self.transaction_cost_bps,
-        )
-        if any(not math.isfinite(v) or v <= 0 for v in positive):
-            raise ValueError("Learning rate must be finite and positive")
-        if any(not math.isfinite(v) or v < 0 for v in nonnegative):
-            raise ValueError("Objective weights and costs must be finite and nonnegative")
+        if self.lookback < 2 or self.hidden_dim < 1 or self.num_threads < 1:
+            raise ValueError("Lookback must be >= 2; dimensions and threads must be positive")
+        fractions = tuple(self.budget_fractions)
+        if (not fractions or len(set(fractions)) != len(fractions)
+                or any(not math.isfinite(f) or not 0 < f <= 1 for f in fractions)):
+            raise ValueError("Budget fractions must be distinct finite values in (0,1]")
+        if any(not math.isfinite(v) or v <= 0
+               for v in (self.learning_rate, self.gradient_clip, self.advantage_scale_floor)):
+            raise ValueError("Learning rate, gradient clip and scale floor must be finite and positive")
+        if not math.isfinite(self.entropy_weight) or self.entropy_weight < 0:
+            raise ValueError("Entropy weight must be finite and nonnegative")
+        object.__setattr__(self, "budget_fractions", fractions)
 
 
 @dataclass
 class FeatureScaler:
-    """Statistics fitted exclusively on observed training rows."""
+    """Statistics fitted exclusively on observed training-prefix rows."""
 
     mean: np.ndarray
     scale: np.ndarray
@@ -65,6 +58,8 @@ class FeatureScaler:
 
     @classmethod
     def fit(cls, frame: FeatureFrame, end: int) -> "FeatureScaler":
+        if not 1 <= end <= len(frame.values):
+            raise ValueError("Scaler training prefix must contain at least one row")
         values = np.asarray(frame.values[:end], dtype=np.float64)
         observed = np.asarray(frame.observed[:end], dtype=bool) & np.isfinite(values)
         counts = observed.sum(axis=0)
@@ -78,83 +73,21 @@ class FeatureScaler:
         )
         scales = np.sqrt(variance)
         scales[scales < 1e-8] = 1.0
+        if not np.isfinite(means).all() or not np.isfinite(scales).all():
+            raise ValueError("Training feature statistics must be finite")
         return cls(means.astype(np.float32), scales.astype(np.float32), counts, list(frame.feature_names))
 
     def transform(self, frame: FeatureFrame) -> tuple[np.ndarray, np.ndarray]:
         if list(frame.feature_names) != self.feature_names:
             raise ValueError("Feature names and order differ from the trained model")
-        values = np.asarray(frame.values, dtype=np.float32)
-        # Features with no training observations have no learned scaler or
-        # encoder behavior. New held-out values remain unavailable until a
-        # subsequent chronological retraining includes them.
+        values = np.asarray(frame.values, dtype=np.float64)
         observed = np.asarray(frame.observed, dtype=bool) & np.isfinite(values) & (self.counts > 0)
-        transformed = np.where(observed, (values - self.mean) / self.scale, 0)
-        return transformed.astype(np.float32), observed
-
-
-class CausalMarketModel(nn.Module):
-    """Group encoders and a unidirectional GRU; future inputs are inaccessible."""
-
-    def __init__(self, feature_count: int, groups: dict[str, list[int]], config: TrainingConfig):
-        super().__init__()
-        self.feature_count = feature_count
-        self.groups = {name: list(indices) for name, indices in groups.items() if indices}
-        self.group_names = list(self.groups)
-        self.config = config
-        self.encoders = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(2 * len(self.groups[name]), config.hidden_dim),
-                nn.GELU(),
-                nn.Linear(config.hidden_dim, config.hidden_dim),
-            ) for name in self.group_names
-        ])
-        self.fusion = nn.Sequential(
-            nn.Linear(config.hidden_dim * len(self.group_names), config.hidden_dim),
-            nn.GELU(),
-        )
-        self.temporal = nn.GRU(config.hidden_dim, config.hidden_dim, batch_first=True)
-        self.reconstruction = nn.Linear(config.hidden_dim, feature_count)
-        self.next_mean = nn.Linear(config.hidden_dim, feature_count)
-        self.next_log_scale = nn.Linear(config.hidden_dim, feature_count)
-        self.allocator = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.hidden_dim), nn.GELU(), nn.Linear(config.hidden_dim, 1),
-        )
-
-    def forward(self, values: torch.Tensor, observed: torch.Tensor) -> dict[str, torch.Tensor]:
-        encoded = []
-        for name, encoder in zip(self.group_names, self.encoders):
-            indices = self.groups[name]
-            # Masks distinguish a real numeric zero from an unavailable value.
-            inputs = torch.cat((values[..., indices] * observed[..., indices], observed[..., indices]), dim=-1)
-            encoded.append(encoder(inputs))
-        fused = self.fusion(torch.cat(encoded, dim=-1))
-        hidden, _ = self.temporal(fused)
-        return {
-            "reconstruction": self.reconstruction(hidden),
-            "next_mean": self.next_mean(hidden),
-            "next_log_scale": self.next_log_scale(hidden).clamp(-5, 2),
-            # Avoid incentives to inflate return forecasts to improve utility.
-            "allocation": torch.sigmoid(self.allocator(hidden.detach())).squeeze(-1) * self.config.max_allocation,
-        }
-
-
-class _Windows(Dataset):
-    def __init__(self, values: np.ndarray, observed: np.ndarray, targets: range, lookback: int):
-        self.values = torch.from_numpy(values)
-        self.observed = torch.from_numpy(observed.astype(np.float32))
-        self.targets = targets
-        self.lookback = lookback
-
-    def __len__(self) -> int:
-        return len(self.targets)
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]:
-        target = self.targets[index]
-        start = target - self.lookback
-        return (
-            self.values[start:target], self.observed[start:target],
-            self.values[target], self.observed[target],
-        )
+        # Unseen modalities remain masked until chronological retraining.
+        safe = np.where(observed, values, self.mean)
+        transformed = ((safe - self.mean) / self.scale).astype(np.float32)
+        if not np.isfinite(transformed).all():
+            raise ValueError("Scaled feature values must be finite")
+        return transformed, observed
 
 
 def _validate_frame(frame: FeatureFrame) -> dict[str, list[int]]:
@@ -183,214 +116,323 @@ def _validate_frame(frame: FeatureFrame) -> dict[str, list[int]]:
     return groups
 
 
-def _return_index(names: list[str]) -> int:
-    if "market.log_return" in names:
-        return names.index("market.log_return")
-    if "log_return" in names:
-        return names.index("log_return")
-    raise ValueError("A market.log_return (or plain log_return) feature is required")
+class _AssetEncoder(nn.Module):
+    """Encode modality masks and a strictly historical temporal window."""
+
+    def __init__(self, groups: dict[str, list[int]], hidden_dim: int):
+        super().__init__()
+        self.groups = groups
+        self.encoders = nn.ModuleList([
+            nn.Sequential(nn.Linear(2 * len(indices), hidden_dim), nn.GELU(),
+                          nn.Linear(hidden_dim, hidden_dim))
+            for indices in groups.values()
+        ])
+        self.fusion = nn.Sequential(nn.Linear(hidden_dim * len(groups), hidden_dim), nn.GELU())
+
+    def forward(self, values: torch.Tensor, observed: torch.Tensor) -> torch.Tensor:
+        encoded = [
+            encoder(torch.cat((values[..., indices] * observed[..., indices], observed[..., indices]), dim=-1))
+            for indices, encoder in zip(self.groups.values(), self.encoders)
+        ]
+        return self.fusion(torch.cat(encoded, dim=-1))
 
 
-def _allocation_loss(
-    output: dict[str, torch.Tensor], return_index: int, scaler: FeatureScaler,
-    config: TrainingConfig, return_observed: torch.Tensor,
-) -> torch.Tensor:
-    # The return head is fitted by next-observation likelihood, not utility.
-    mu = output["next_mean"][:, -1, return_index].detach() * float(scaler.scale[return_index]) + float(scaler.mean[return_index])
-    sigma = output["next_log_scale"][:, -1, return_index].detach().exp() * float(scaler.scale[return_index])
-    allocation = output["allocation"][:, -1]
-    previous = output["allocation"][:, -2].detach()
-    expected_simple_return = torch.expm1((mu + sigma.square() / 2).clamp(-20, 5))
-    variance = (torch.expm1(sigma.square().clamp(max=10)) * (2 * mu + sigma.square()).clamp(-20, 10).exp())
-    # Gaussian expected shortfall below the 5th percentile: mu - 2.063 sigma.
-    lower_tail_loss = (-torch.expm1((mu - 2.063 * sigma).clamp(-20, 5))).clamp_min(0)
-    turnover = (allocation - previous).abs()
-    transaction_cost = config.transaction_cost_bps / 10000 * (turnover + allocation)
-    utility = (
-        allocation * expected_simple_return - transaction_cost
-        - 0.5 * config.risk_aversion * allocation.square() * variance
-        - config.tail_aversion * allocation * lower_tail_loss
-    )
-    return -(utility * return_observed).sum() / return_observed.sum().clamp_min(1)
+class PolicyModel(nn.Module):
+    """Account-conditioned categorical actions across the allowed stocks.
+
+    Per-asset modality encoders share a past-only GRU. Cross-asset attention
+    jointly considers competing stock opportunities and current inventory.
+    Its only outputs are action logits. No forecast or reward-prediction head
+    exists: perception and decisions learn directly from evaluator rewards.
+    """
+
+    def __init__(self, groups: dict[str, dict[str, list[int]]], config: PolicyConfig):
+        super().__init__()
+        self.universe = tuple(groups)
+        self.groups = groups
+        self.config = config
+        width = config.hidden_dim
+        self.encoders = nn.ModuleList([_AssetEncoder(group, width) for group in groups.values()])
+        self.temporal = nn.GRU(width, width, batch_first=True)
+        self.symbol_embedding = nn.Parameter(torch.randn(len(groups), width) * 0.02)
+        self.account_encoder = nn.Sequential(nn.Linear(5, width), nn.GELU())
+        self.inventory_encoder = nn.Sequential(nn.Linear(3, width), nn.GELU())
+        self.attention = nn.MultiheadAttention(width, num_heads=1, batch_first=True)
+        self.action_head = nn.Sequential(
+            nn.Linear(2 * width, width), nn.GELU(), nn.Linear(width, 2 * len(config.budget_fractions)),
+        )
+        self.hold_head = nn.Linear(2 * width, 1)
+
+    def forward(
+        self, values: list[torch.Tensor], observed: list[torch.Tensor],
+        account: torch.Tensor, inventory: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        embeddings = []
+        for encoder, x, mask in zip(self.encoders, values, observed):
+            _, hidden = self.temporal(encoder(x, mask))
+            embeddings.append(hidden[-1])
+        assets = torch.stack(embeddings, dim=1) + self.symbol_embedding.unsqueeze(0)
+        account_hidden = self.account_encoder(account)
+        assets = assets + self.inventory_encoder(inventory) + account_hidden.unsqueeze(1)
+        attended, _ = self.attention(assets, assets, assets, need_weights=False)
+        assets = assets + attended
+        context = torch.cat((assets.mean(dim=1), account_hidden), dim=-1)
+        per_asset = self.action_head(torch.cat((assets, account_hidden.unsqueeze(1).expand_as(assets)), dim=-1))
+        logits = torch.cat((self.hold_head(context), per_asset.flatten(start_dim=1)), dim=-1)
+        return {"logits": logits}
 
 
 @dataclass
-class TrainingResult:
-    model: CausalMarketModel
-    scaler: FeatureScaler
-    config: TrainingConfig
-    history: list[dict[str, float]]
-    splits: dict[str, tuple[int, int]]
-    symbol: str
-    training_last_timestamp: str
-    validation_last_timestamp: str
+class PolicySample:
+    action: TradingAction
+    log_probability: torch.Tensor
+    entropy: torch.Tensor
 
-    def predict(self, frame: FeatureFrame, index: int | None = None) -> Forecast:
-        """Predict the next interval from a full past window ending at index."""
-        if frame.symbol != self.symbol:
-            raise ValueError("This checkpoint was trained for a different symbol")
-        if list(frame.feature_names) != self.scaler.feature_names:
-            raise ValueError("Feature names and order differ from the trained model")
-        shape = np.asarray(frame.values).shape
-        if (len(shape) != 2 or shape != np.asarray(frame.observed).shape
-                or shape[1] != len(frame.feature_names)
-                or shape[0] != len(frame.timestamps) or shape[0] != len(frame.prices)):
-            raise ValueError("Timestamps, prices, features and observed masks must align")
-        index = shape[0] - 1 if index is None else index
-        if not self.config.lookback - 1 <= index < shape[0]:
-            raise ValueError("Prediction index must have a complete historical window")
-        start = index + 1 - self.config.lookback
-        # Transform only past context. Repeated evaluation costs O(T*lookback)
-        # and neither reads nor validates observations beyond decision time.
-        window = FeatureFrame(
-            frame.timestamps[start:index + 1], frame.values[start:index + 1],
-            frame.observed[start:index + 1], frame.feature_names, frame.groups,
-            frame.prices[start:index + 1], frame.symbol,
-        )
-        _validate_frame(window)
-        values, observed = self.scaler.transform(window)
-        self.model.eval()
-        with torch.no_grad():
-            output = self.model(
-                torch.from_numpy(values).unsqueeze(0),
-                torch.from_numpy(observed.astype(np.float32)).unsqueeze(0),
+
+@dataclass
+class PolicyAgent:
+    model: PolicyModel
+    scalers: dict[str, FeatureScaler]
+    config: PolicyConfig
+    universe: tuple[str, ...]
+    initial_funding: float
+    train_end: int
+    training_last_timestamp: str
+    validation_end: int | None = None
+    validation_last_timestamp: str | None = None
+    _optimizer: torch.optim.Optimizer | None = None
+    reward_count: int = 0
+    reward_mean: float = 0.0
+    reward_m2: float = 0.0
+
+    @classmethod
+    def create(
+        cls, frames: dict[str, FeatureFrame], universe: tuple[str, ...],
+        train_end: int, initial_funding: float, config: PolicyConfig | None = None,
+    ) -> "PolicyAgent":
+        config = config or PolicyConfig()
+        universe = tuple(universe)
+        if not universe or len(set(universe)) != len(universe) or any(not s for s in universe):
+            raise ValueError("The trading universe must contain distinct nonempty symbols")
+        if any(symbol not in frames for symbol in universe):
+            raise ValueError("Every allowed stock must have a supplied feature frame")
+        if not math.isfinite(initial_funding) or initial_funding <= 0:
+            raise ValueError("Initial funding must be finite and positive")
+        groups = {}
+        scalers = {}
+        timestamps = None
+        for symbol in universe:
+            frame = frames[symbol]
+            if frame.symbol != symbol:
+                raise ValueError("Feature-frame symbol must match the allowed stock")
+            if not config.lookback < train_end <= len(frame.values):
+                raise ValueError("Require lookback < train_end <= row count")
+            # Training setup validates only the fitted prefix, never held-out rows.
+            prefix = FeatureFrame(
+                frame.timestamps[:train_end], frame.values[:train_end], frame.observed[:train_end],
+                frame.feature_names, frame.groups, frame.prices[:train_end], symbol,
             )
-        return_index = _return_index(self.scaler.feature_names)
-        mu = float(output["next_mean"][0, -1, return_index]) * float(self.scaler.scale[return_index]) + float(self.scaler.mean[return_index])
-        sigma = float(output["next_log_scale"][0, -1, return_index].exp()) * float(self.scaler.scale[return_index])
-        sigma2 = min(sigma * sigma, 10.0)
-        mean = math.expm1(min(max(mu + sigma2 / 2, -20), 5))
-        variance = math.expm1(sigma2) * math.exp(min(max(2 * mu + sigma2, -20), 10))
-        downside = math.expm1(min(max(mu - 1.644853627 * sigma, -20), 5))
-        trained = self.scaler.counts > 0
-        coverage = float(observed[:, trained].mean()) if trained.any() else 0.0
-        # This is a data/uncertainty gate score, not calibrated prediction accuracy.
-        confidence = coverage * math.exp(-sigma / 0.02)
-        return Forecast(mean, math.sqrt(variance), downside, confidence, float(output["allocation"][0, -1]))
+            groups[symbol] = _validate_frame(prefix)
+            if timestamps is not None and prefix.timestamps != timestamps:
+                raise ValueError("Allowed stocks must have aligned training timestamps")
+            timestamps = prefix.timestamps
+            scalers[symbol] = FeatureScaler.fit(prefix, train_end)
+        with torch.random.fork_rng():
+            torch.manual_seed(config.seed)
+            model = PolicyModel(groups, config)
+        return cls(model, scalers, config, universe, initial_funding, train_end, timestamps[-1].isoformat())
+
+    def _inputs(
+        self, frames: dict[str, FeatureFrame], index: int, state: PortfolioState,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor]:
+        if not isinstance(index, int) or index < self.config.lookback - 1:
+            raise ValueError("Decision index must have a complete historical window")
+        if not math.isfinite(state.initial_funding) or state.initial_funding <= 0:
+            raise ValueError("Initial funding must be finite and positive")
+        if not math.isfinite(state.cash) or state.cash < 0:
+            raise ValueError("Available cash must be finite and nonnegative")
+        if any(symbol not in self.universe and amount != 0 for symbol, amount in state.holdings.items()):
+            raise ValueError("Portfolio positions must belong to the allowed stock universe")
+        values, masks = [], []
+        timestamps = None
+        inventory = []
+        equity = state.equity
+        if not math.isfinite(equity) or equity <= 0:
+            raise ValueError("Account equity must be finite and positive")
+        for symbol in self.universe:
+            if symbol not in frames or symbol not in state.prices:
+                raise ValueError("Every allowed stock requires historical features and a current price")
+            frame = frames[symbol]
+            if frame.symbol != symbol or not index < len(frame.values):
+                raise ValueError("Decision frame and index must match the allowed stock")
+            start = index + 1 - self.config.lookback
+            window = FeatureFrame(
+                frame.timestamps[start:index + 1], frame.values[start:index + 1],
+                frame.observed[start:index + 1], frame.feature_names, frame.groups,
+                frame.prices[start:index + 1], symbol,
+            )
+            groups = _validate_frame(window)
+            if groups != self.model.groups[symbol]:
+                raise ValueError("Feature modality groups differ from the trained model")
+            if timestamps is not None and window.timestamps != timestamps:
+                raise ValueError("Allowed stocks must have aligned decision timestamps")
+            timestamps = window.timestamps
+            x, mask = self.scalers[symbol].transform(window)
+            values.append(torch.from_numpy(x).unsqueeze(0))
+            masks.append(torch.from_numpy(mask.astype(np.float32)).unsqueeze(0))
+            price, quantity = state.prices[symbol], state.holdings.get(symbol, 0)
+            if not math.isfinite(price) or price <= 0:
+                raise ValueError("Current prices must be finite and positive")
+            if not isinstance(quantity, int) or quantity < 0:
+                raise ValueError("Portfolio shares must be nonnegative integers")
+            inventory.append([math.log1p(price) / 10, quantity * price / equity, math.log1p(quantity) / 10])
+        peak = equity if state.peak_equity is None else state.peak_equity
+        day_start = equity if state.day_start_equity is None else state.day_start_equity
+        if any(not math.isfinite(v) or v <= 0 for v in (peak, day_start)):
+            raise ValueError("Peak equity and day-start equity must be finite and positive")
+        account = [math.log1p(state.initial_funding) / 10, equity / state.initial_funding,
+                   state.cash / equity, max(0.0, 1 - equity / peak), equity / day_start - 1]
+        return values, masks, torch.tensor([account], dtype=torch.float32), torch.tensor([inventory], dtype=torch.float32)
+
+    def _actions(
+        self, state: PortfolioState, allowed_symbols: tuple[str, ...] | None = None,
+    ) -> tuple[list[TradingAction], torch.Tensor]:
+        allowed = self.universe if allowed_symbols is None else tuple(allowed_symbols)
+        if (not allowed or len(set(allowed)) != len(allowed)
+                or any(symbol not in self.universe for symbol in allowed)):
+            raise ValueError("Runtime allowed symbols must be a distinct nonempty subset of the trained universe")
+        actions = [TradingAction(0, None, "hold", 0.0, 0.0)]
+        mask = [True]
+        for symbol in self.universe:
+            price = state.prices[symbol]
+            held_value = state.holdings.get(symbol, 0) * price
+            for side in ("buy", "sell"):
+                for fraction in self.config.budget_fractions:
+                    requested = state.initial_funding * fraction
+                    amount = (requested if side == "buy" or held_value == 0
+                              else min(requested, held_value))
+                    actions.append(TradingAction(len(actions), symbol, side, amount, fraction))
+                    mask.append(symbol in allowed and amount >= price
+                                and (amount <= state.cash if side == "buy" else held_value > 0))
+        return actions, torch.tensor(mask, dtype=torch.bool)
+
+    def distribution(
+        self, frames: dict[str, FeatureFrame], index: int, state: PortfolioState,
+        allowed_symbols: tuple[str, ...] | None = None,
+    ) -> tuple[Categorical, list[TradingAction]]:
+        """Return masked direct-action probabilities and cash-valued actions."""
+        inputs = self._inputs(frames, index, state)
+        actions, available = self._actions(state, allowed_symbols)
+        output = self.model(*inputs)
+        logits = output["logits"].squeeze(0).masked_fill(~available, -torch.inf)
+        if not torch.isfinite(output["logits"]).all():
+            raise ValueError("Nonfinite policy output")
+        return Categorical(logits=logits), actions
+
+    def act(
+        self, frames: dict[str, FeatureFrame], index: int, state: PortfolioState,
+        deterministic: bool = False,
+        allowed_symbols: tuple[str, ...] | None = None,
+    ) -> PolicySample:
+        """Select a direct action; preserve its graph for delayed feedback."""
+        distribution, actions = self.distribution(frames, index, state, allowed_symbols)
+        action_id = distribution.probs.argmax() if deterministic else distribution.sample()
+        return PolicySample(actions[int(action_id)], distribution.log_prob(action_id), distribution.entropy())
+
+    def update(
+        self, samples: list[PolicySample], feedback: list[float], learning_rate: float | None = None,
+    ) -> dict[str, float]:
+        """REINFORCE update from matured, observed evaluator rewards only.
+
+        ``feedback`` contains each action's own fixed-horizon observed advantage
+        over its no-action baseline. These overlapping, non-additive advantages
+        must never be summed into reward-to-go: credit for a later protective
+        sale must not turn a preceding harmful purchase into a rewarded action.
+        There is no price or return target. Above-baseline feedback increases
+        an action's likelihood; below-baseline feedback decreases it. Samples
+        must precede any intervening optimizer step because they retain the
+        rollout computation graphs.
+        """
+        if not samples or len(samples) != len(feedback):
+            raise ValueError("Feedback requires matching nonempty samples and action advantages")
+        if any(not math.isfinite(r) for r in feedback):
+            raise ValueError("Evaluator feedback must be finite")
+        rate = self.config.learning_rate if learning_rate is None else learning_rate
+        if not math.isfinite(rate) or rate <= 0:
+            raise ValueError("Learning rate must be finite and positive")
+        if self._optimizer is None:
+            self._optimizer = torch.optim.Adam(self.model.parameters(), lr=rate)
+        else:
+            for group in self._optimizer.param_groups:
+                group["lr"] = rate
+        targets = torch.tensor(feedback, dtype=torch.float32)
+        # Prior episodes supply the mean/variance of individual action feedback,
+        # never cumulative rewards. Centering this batch on its own mean would
+        # erase all learning from a single evaluated action.
+        baseline = self.reward_mean
+        scale = 1.0
+        if self.config.normalize_advantages:
+            variance = self.reward_m2 / max(1, self.reward_count - 1)
+            scale = max(math.sqrt(max(0.0, variance)), float(targets.std(unbiased=False)),
+                        self.config.advantage_scale_floor)
+        advantages = ((targets - baseline) / scale).detach()
+        log_probabilities = torch.stack([sample.log_probability for sample in samples])
+        entropy = torch.stack([sample.entropy for sample in samples]).mean()
+        policy_loss = -(log_probabilities * advantages).mean()
+        total = policy_loss - self.config.entropy_weight * entropy
+        if not torch.isfinite(total):
+            raise ValueError("Nonfinite evaluator-feedback objective")
+        self._optimizer.zero_grad()
+        total.backward()
+        nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip, error_if_nonfinite=True)
+        self._optimizer.step()
+        for reward in feedback:
+            self.reward_count += 1
+            delta = reward - self.reward_mean
+            self.reward_mean += delta / self.reward_count
+            self.reward_m2 += delta * (reward - self.reward_mean)
+        return {"policy_loss": float(policy_loss.detach()), "entropy": float(entropy.detach()),
+                "total_loss": float(total.detach()), "mean_feedback": float(targets.mean()),
+                "baseline": baseline, "advantage_scale": scale, "samples": float(len(samples))}
 
     def save(self, path: str | Path) -> None:
-        """Write only tensors and plain metadata; load with weights_only=True."""
+        """Save tensors and plain metadata for safe weights-only loading."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
-            "format_version": 1,
-            "state_dict": self.model.state_dict(),
-            "config": asdict(self.config),
-            "feature_names": self.scaler.feature_names,
-            "groups": self.model.groups,
-            "mean": torch.from_numpy(self.scaler.mean),
-            "scale": torch.from_numpy(self.scaler.scale),
-            "counts": torch.from_numpy(self.scaler.counts),
-            "history": self.history,
-            "splits": self.splits,
-            "symbol": self.symbol,
+            "format_version": 2, "model_kind": "direct_action_policy",
+            "state_dict": self.model.state_dict(), "config": asdict(self.config),
+            "universe": self.universe, "groups": self.model.groups,
+            "initial_funding": self.initial_funding, "train_end": self.train_end,
             "training_last_timestamp": self.training_last_timestamp,
+            "validation_end": self.validation_end,
             "validation_last_timestamp": self.validation_last_timestamp,
+            "reward_count": self.reward_count, "reward_mean": self.reward_mean, "reward_m2": self.reward_m2,
+            "scalers": {symbol: {"mean": torch.from_numpy(scaler.mean),
+                                 "scale": torch.from_numpy(scaler.scale),
+                                 "counts": torch.from_numpy(scaler.counts),
+                                 "feature_names": scaler.feature_names}
+                        for symbol, scaler in self.scalers.items()},
         }, path)
 
     @classmethod
-    def load(cls, path: str | Path) -> "TrainingResult":
+    def load(cls, path: str | Path) -> "PolicyAgent":
         artifact = torch.load(path, map_location="cpu", weights_only=True)
-        if artifact.get("format_version") != 1:
-            raise ValueError("Unsupported model artifact format")
-        config = TrainingConfig(**artifact["config"])
-        scaler = FeatureScaler(
-            artifact["mean"].numpy(), artifact["scale"].numpy(),
-            artifact["counts"].numpy(), list(artifact["feature_names"]),
-        )
-        model = CausalMarketModel(len(scaler.feature_names), artifact["groups"], config)
+        if artifact.get("format_version") != 2 or artifact.get("model_kind") != "direct_action_policy":
+            raise ValueError("Unsupported artifact: a direct-action policy checkpoint is required")
+        config = PolicyConfig(**artifact["config"])
+        universe = tuple(artifact["universe"])
+        scalers = {symbol: FeatureScaler(payload["mean"].numpy(), payload["scale"].numpy(),
+                                         payload["counts"].numpy(), list(payload["feature_names"]))
+                   for symbol, payload in artifact["scalers"].items()}
+        model = PolicyModel(artifact["groups"], config)
+        if model.universe != universe or set(scalers) != set(universe):
+            raise ValueError("Checkpoint stock universe and feature schemas disagree")
         model.load_state_dict(artifact["state_dict"], strict=True)
         model.eval()
-        return cls(
-            model, scaler, config, artifact["history"], artifact["splits"],
-            artifact["symbol"], artifact["training_last_timestamp"],
-            artifact["validation_last_timestamp"],
-        )
-
-
-def train_model(
-    frame: FeatureFrame,
-    train_end: int,
-    validation_end: int,
-    config: TrainingConfig | None = None,
-) -> TrainingResult:
-    """Train with half-open chronological row boundaries.
-
-    Target rows [lookback,train_end) train the network. Targets
-    [train_end,validation_end) select the checkpoint; subsequent rows are
-    held out. Context can come from an earlier partition; target labels never
-    cross its end. No statistic or gradient is fitted on held-out rows.
-    """
-    config = config or TrainingConfig()
-    groups = _validate_frame(frame)
-    if not config.lookback + 1 <= train_end < validation_end <= len(frame.values):
-        raise ValueError("Require lookback < train_end < validation_end <= row count")
-    return_index = _return_index(frame.feature_names)
-    scaler = FeatureScaler.fit(frame, train_end)
-    if scaler.counts[return_index] < 2:
-        raise ValueError("At least two observed training returns are required")
-    values, observed = scaler.transform(frame)
-    torch.manual_seed(config.seed)
-    np.random.seed(config.seed)
-    previous_threads = torch.get_num_threads()
-    torch.set_num_threads(config.num_threads)
-    try:
-        model = CausalMarketModel(values.shape[1], groups, config)
-        optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
-        train = DataLoader(_Windows(values, observed, range(config.lookback, train_end), config.lookback), batch_size=config.batch_size, shuffle=False)
-        validation = DataLoader(_Windows(values, observed, range(train_end, validation_end), config.lookback), batch_size=config.batch_size, shuffle=False)
-        history: list[dict[str, float]] = []
-        best_score = float("inf")
-        best_state: dict[str, Any] | None = None
-        for epoch in range(config.epochs):
-            model.train()
-            totals = np.zeros(4, dtype=float)
-            count = 0
-            for x, available, target, target_available in train:
-                masked = (torch.rand_like(available) < config.mask_probability) & available.bool()
-                presented = available * ~masked
-                output = model(x * presented, presented)
-                reconstruction = (((output["reconstruction"] - x).square()) * masked).sum() / masked.sum().clamp_min(1)
-                mean = output["next_mean"][:, -1]
-                log_scale = output["next_log_scale"][:, -1]
-                nll = ((0.5 * (target - mean).square() * (-2 * log_scale).exp() + log_scale) * target_available).sum() / target_available.sum().clamp_min(1)
-                allocation_loss = _allocation_loss(output, return_index, scaler, config, target_available[:, return_index])
-                loss = nll + config.reconstruction_weight * reconstruction + config.allocation_weight * allocation_loss
-                if not torch.isfinite(loss):
-                    raise ValueError("Nonfinite training objective; inspect feature magnitudes and observations")
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
-                optimizer.step()
-                batch_size = len(x)
-                totals += np.array([float(loss.detach()), float(nll.detach()), float(reconstruction.detach()), float(allocation_loss.detach())]) * batch_size
-                count += batch_size
-            model.eval()
-            validation_sum = 0.0
-            validation_observations = 0.0
-            with torch.no_grad():
-                for x, available, target, target_available in validation:
-                    output = model(x, available)
-                    mean, log_scale = output["next_mean"][:, -1], output["next_log_scale"][:, -1]
-                    losses = 0.5 * (target - mean).square() * (-2 * log_scale).exp() + log_scale
-                    validation_sum += float((losses * target_available).sum())
-                    validation_observations += float(target_available.sum())
-            if validation_observations == 0:
-                raise ValueError("Validation partition contains no observed target features")
-            score = validation_sum / validation_observations
-            if not math.isfinite(score):
-                raise ValueError("Nonfinite validation objective")
-            history.append(dict(zip(("train_loss", "next_nll", "reconstruction", "allocation_loss"), (totals / count).tolist()), epoch=float(epoch + 1), validation_nll=score))
-            if score < best_score:
-                best_score = score
-                best_state = deepcopy(model.state_dict())
-        assert best_state is not None
-        model.load_state_dict(best_state)
-        model.eval()
-        return TrainingResult(
-            model, scaler, config, history,
-            {"train": (config.lookback, train_end), "validation": (train_end, validation_end), "test": (validation_end, len(values))},
-            frame.symbol, frame.timestamps[train_end - 1].isoformat(), frame.timestamps[validation_end - 1].isoformat(),
-        )
-    finally:
-        torch.set_num_threads(previous_threads)
+        return cls(model, scalers, config, universe, artifact["initial_funding"],
+                   artifact["train_end"], artifact["training_last_timestamp"],
+                   validation_end=artifact.get("validation_end"),
+                   validation_last_timestamp=artifact.get("validation_last_timestamp"),
+                   reward_count=artifact["reward_count"], reward_mean=artifact["reward_mean"],
+                   reward_m2=artifact["reward_m2"])
