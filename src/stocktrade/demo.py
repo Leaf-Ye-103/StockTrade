@@ -1,4 +1,4 @@
-"""Generate SYNTHETIC fixtures to test software, never historical performance."""
+"""Synthetic multi-stock records for software validation, not investment evidence."""
 
 import csv
 import json
@@ -8,57 +8,71 @@ from pathlib import Path
 import numpy as np
 
 
-def generate_demo(output: str | Path, *, count: int = 420, frequency_seconds: int = 60, seed: int = 7):
-    if count < 100 or frequency_seconds < 1:
-        raise ValueError("Demo needs at least 100 bars and positive whole-second spacing")
+def generate_demo(output, *, count=240, frequency_seconds=60, seed=7,
+                  symbols=("NVDA", "MSFT", "AAPL")):
+    if count < 100 or not isinstance(frequency_seconds, int) or frequency_seconds < 1:
+        raise ValueError("Demo needs >=100 bars and positive whole-second spacing")
+    symbols = tuple(symbols)
+    if not symbols or len(set(symbols)) != len(symbols):
+        raise ValueError("Demo stock symbols must be distinct and nonempty")
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
     origin = datetime(2025, 1, 6, 14, 30, tzinfo=timezone.utc)
-    price = 100.0
-    bars, trades, events = [], [], []
-    for i in range(count):
-        timestamp = origin + timedelta(seconds=(i + 1) * frequency_seconds)
-        previous = price
-        change = float(rng.normal(0.00015 + 0.00035 * np.sin(i / 30), 0.0015))
-        price *= np.exp(change)
-        spread = price * 0.0002
-        bid, ask = price - spread / 2, price + spread / 2
-        bars.append(dict(timestamp=timestamp.isoformat(), symbol="DEMO", open=previous,
-                         high=max(price, previous) * 1.0005, low=min(price, previous) * 0.9995,
-                         close=price, volume=int(rng.integers(3000, 12000)), bid=bid, ask=ask,
-                         bid_size=int(rng.integers(200, 1200)), ask_size=int(rng.integers(200, 1200))))
-        # These are fabricated test records, not observations of a real exchange.
-        # They exercise matching independently of whatever sizes a model chooses.
-        for j, qty in enumerate((10, 25, 50, 100, 250)):
-            for side in ("buy", "sell"):
-                trades.append(dict(timestamp=(timestamp + timedelta(milliseconds=200 + j * 20)).isoformat(),
-                                   trade_id=f"SYNTHETIC-{i}-{j}-{side}", symbol="DEMO", side=side,
-                                   quantity=qty, price=ask if side == "buy" else bid,
-                                   bid=bid, ask=ask, spread=spread, volatility=0.0015))
-        if i % 20 == 0:
-            events.extend([
-                dict(published_at=timestamp.isoformat(), available_at=timestamp.isoformat(), source="synthetic",
-                     kind="macro", values={"fed_rate": 0.04, "market_return": float(rng.normal(0, .001))}),
-                dict(published_at=timestamp.isoformat(), available_at=timestamp.isoformat(), source="synthetic",
-                     kind="news", symbol="DEMO", values={}, text="Synthetic demand and earnings update"),
-                dict(published_at=timestamp.isoformat(), available_at=timestamp.isoformat(), source="synthetic",
-                     kind="orderflow", symbol="DEMO", values={"bid_depth_5": bars[-1]["bid_size"] * 2,
-                     "ask_depth_5": bars[-1]["ask_size"] * 2, "cancellation_ratio": float(rng.uniform(0, .3))}),
-            ])
-        if i % 100 == 0:
-            events.append(dict(published_at=timestamp.isoformat(), available_at=timestamp.isoformat(),
-                               source="synthetic", kind="fundamentals", symbol="DEMO",
-                               values={"revenue": 1e9 * (1 + i / 1000), "debt_to_equity": 0.3}))
-    for name, rows in (("bars.csv", bars), ("trades.csv", trades)):
-        with (output / name).open("w", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
-            writer.writeheader()
-            writer.writerows(rows)
+    prices = {symbol: 100.0 + 40 * j for j, symbol in enumerate(symbols)}
+    bars, events = [], []
+    trade_fields = ["timestamp", "trade_id", "symbol", "side", "quantity", "price",
+                    "bid", "ask", "spread", "volatility"]
+    with (output / "trades.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=trade_fields)
+        writer.writeheader()
+        for index in range(count):
+            timestamp = origin + timedelta(seconds=(index + 1) * frequency_seconds)
+            common_return = float(rng.normal(0, .0005))
+            for number, symbol in enumerate(symbols):
+                previous = prices[symbol]
+                drift = .0004 * np.sin(index / 25 + number)
+                price = previous * np.exp(common_return + rng.normal(drift, .0013))
+                prices[symbol] = price
+                spread = price * .0002
+                bid, ask = price - spread / 2, price + spread / 2
+                bars.append(dict(timestamp=timestamp.isoformat(), symbol=symbol, open=previous,
+                    high=max(price, previous) * 1.0005, low=min(price, previous) * .9995,
+                    close=price, volume=6000, bid=bid, ask=ask, bid_size=700, ask_size=650))
+                # Explicitly fabricated records cover software sizing branches. They
+                # never establish that these executions existed on a real exchange.
+                for quantity in range(1, 61):
+                    for side in ("buy", "sell"):
+                        writer.writerow(dict(
+                            timestamp=(timestamp + timedelta(milliseconds=150 + quantity)).isoformat(),
+                            trade_id=f"SYNTHETIC-{index}-{symbol}-{quantity}-{side}", symbol=symbol,
+                            side=side, quantity=quantity, price=ask if side == "buy" else bid,
+                            bid=bid, ask=ask, spread=spread, volatility=.0015))
+                if index % 20 == 0:
+                    events.extend([
+                        dict(published_at=timestamp.isoformat(), available_at=timestamp.isoformat(),
+                             source="synthetic", kind="news", symbol=symbol, values={},
+                             text=f"Synthetic demand and earnings update for {symbol}"),
+                        dict(published_at=timestamp.isoformat(), available_at=timestamp.isoformat(),
+                             source="synthetic", kind="orderflow", symbol=symbol,
+                             values={"bid_depth_5": 2000, "ask_depth_5": 1800,
+                                     "cancellation_ratio": float(rng.uniform(0, .3))}),
+                    ])
+                if index % 100 == 0:
+                    events.append(dict(published_at=timestamp.isoformat(), available_at=timestamp.isoformat(),
+                        source="synthetic", kind="fundamentals", symbol=symbol,
+                        values={"revenue": 1e9 * (1 + number / 10), "debt_to_equity": .3}))
+            if index % 20 == 0:
+                events.append(dict(published_at=timestamp.isoformat(), available_at=timestamp.isoformat(),
+                    source="synthetic", kind="macro", values={"fed_rate": .04, "market_return": common_return}))
+    with (output / "bars.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(bars[0]))
+        writer.writeheader()
+        writer.writerows(bars)
     with (output / "events.jsonl").open("w") as handle:
         for event in events:
             handle.write(json.dumps(event) + "\n")
-    (output / "provenance.json").write_text(json.dumps({"synthetic": True, "seed": seed,
-        "frequency_seconds": frequency_seconds, "bars": count,
-        "purpose": "Software validation only; no historical performance evidence"}, indent=2) + "\n")
+    (output / "provenance.json").write_text(json.dumps(dict(synthetic=True, seed=seed,
+        frequency_seconds=frequency_seconds, bars_per_stock=count, symbols=symbols,
+        purpose="Software checks only; no historical performance evidence"), indent=2) + "\n")
     return output

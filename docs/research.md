@@ -1,50 +1,78 @@
 # Research methodology
 
-The implemented workflow is a starting point for experiments. It trains without manually labelled buy/sell targets, constrains proposed allocations, and evaluates whether observed historical executions support those proposals. It cannot establish that the strategy would make money in deployment.
+The system learns a direct trading policy from a separate observed-data evaluator. It receives no manually labelled trading decisions and has no market prediction objective. This is offline reinforcement learning with shaped delayed feedback, rather than purely unsupervised representation learning. A trainable policy and a coherent reward do not establish a financial edge.
 
-## Learning without labelled decisions
+## Why decision feedback differs from trade profit
 
-Self-supervised learning derives training targets from the input sequence: reconstruct held-out observations and predict subsequent observations. This is a form of unsupervised representation learning. Any portfolio objective derived from future training-period returns is a further data-derived learning signal; it is not a manually labelled trading decision.
+A round-trip profit cannot tell whether both decisions were good. Buying at $100 and selling at $95 loses $5, but a later decline to $10 makes selling preferable to retaining that exposure. Treating both decisions as equally bad hides this distinction.
 
-A trainable policy and a historical utility objective are not the same as a validated financial edge. Learn preprocessing parameters only from the training interval. Select model and risk hyperparameters on a validation interval, then evaluate once on a later held-out interval. Report the model's exact features, training dates, random seed and checkpoint with each result.
+The active portfolio evaluator freezes the cash and **all shares held immediately before each decision**, then marks that baseline with later observed prices. The comparison path is the account ledger, including the decision and later supported actions. For a simple account with no subsequent trades, this reduces to:
 
-## Historical matching and what it proves
+| Action | Baseline | Fixed-horizon marked advantage |
+| --- | --- | --- |
+| Buy `q` shares at recorded price `p` | Retain the purchase cash | `q × (future mark − p)` |
+| Sell `q` owned shares at recorded price `p` | Retain those same shares | `q × (p − future mark)` |
+| Hold | Freeze the existing cash/shares | Zero if no later supported account changes; otherwise evaluate the observed continuation |
 
-For a proposed order, the evaluator asks whether sufficiently similar observed executions occurred in a limited subsequent window. Matching preserves the symbol, execution mode, limit price, quantity and relevant market conditions. Aggressive analogs share the aggressor side; passive analogs use the opposite aggressor side and need order-level queue evidence. Incompatible or insufficient records produce abstention. Keep an audit trail from each supported analog to its source records.
+These baselines do not assume another buy or sale. Future closes are valuation marks, not claimed exit fills. The evolving comparison path changes its account only through supported recorded executions. Cash has a zero nominal return baseline; financing, interest, taxes and dividends are outside the current reward convention.
 
-For example, an aggressive proposal to buy 100 shares at a $225 limit needs a compatible recorded buy-aggressor execution at or below $225, after the assumed arrival delay, supported by contemporaneous quote and regime context. The CLI requires an actual quantity of 100 shares. The standalone API can permit a smaller near-size analog and retains its quantity unchanged. A close price of $224 or total minute volume of 10,000 alone is insufficient. Even compatible executions do not prove that this additional order would have received those executions.
+At the default eight-step horizon, the evaluator combines account-equity advantages at steps 1, 4 and 8 with weights 25%, 25% and 50%. It adds `0.25 × (baseline downside − ledger downside)`, where each downside is the maximum dollar loss below pre-decision equity over that horizon. This is a starting-equity loss measure, distinct from peak-to-trough percentage drawdown. Execution fees already reduced ledger equity and are not deducted again. Feedback is normalized by initial funding. This can capture the value of replacing one exposure with another through subsequent supported trades, rather than evaluating every purchase as permanently held through its horizon.
 
-Results are conditional counterfactual portfolio estimates. The new order may displace existing orders, change depth, reveal information, or trigger other traders' responses. Historical matching does not observe those outcomes. It cannot causally identify your own market impact or a queue changed by insertion of your order.
+For one share sold at $95, a terminal $10 mark gives an $85 advantage over retaining that share, before weights, risk shaping and ledger fees. A terminal $110 mark gives a $15 disadvantage. An earlier purchase at $100 is evaluated from its own pre-decision account: if the subsequent sale at $95 is supported, its continuation has $95 cash, a $5 loss against retaining the original $100. It is not penalized as though it remained invested until $10. Selling can therefore be rewarded for preventing more loss while the purchase receives its own negative feedback.
 
-This restriction should affect reported conclusions. Low support coverage, small samples, concentrated regimes, and loose matching tolerances all weaken an apparent result. An evaluator that frequently abstains may provide useful evidence that the available dataset does not support the strategy.
+“Later” has a predeclared meaning. A decline after the configured horizon will not retroactively change feedback. The evaluator does not compare against the best hindsight trade, choose a favorable endpoint, or mark an unmatched action as if it executed. Horizon, weights, fees and downside coefficients are experiment settings selected on training/validation data and frozen for the held-out period.
+
+## Learning from delayed feedback
+
+The neural policy consumes funding, allowed symbols, current cash/holdings and point-in-time stock histories. It outputs a categorical hold or a symbol, side and dollar budget. Modality encoders, a GRU and cross-stock attention are trainable end to end.
+
+Training samples actions and updates their probabilities using REINFORCE with an empirical running reward baseline from prior updates and entropy regularization. The loss is based on observed evaluator feedback, not error between predicted and realized stock prices. Each decision receives one account-path comparison after its complete horizon matures. Later supported actions influence that path, but the trainer never adds their individual shaped feedback to the earlier decision. A hold can receive feedback from subsequently supported portfolio choices, such as waiting before buying; absent later account changes, its feedback is zero. Hard-constraint costs, when present, are separately identified policy penalties rather than invented trading losses.
+
+Decision feedback comparisons overlap economically and are not additive trajectory rewards. In the buy-at-$100, supported-sale-at-$95, later-$10 example, adding the sale's avoided-loss reward to the purchase's account loss could give the poor purchase a positive training signal. The trainer never does this: it computes each decision's own trajectory advantage against its own frozen account baseline. There is no discounted sum of later shaped rewards. A later supported sale affects the earlier actual cash/holdings path, rather than contributing its separate avoided-loss bonus. **Feedback sums are diagnostic only, not portfolio profit or the checkpoint-selection objective.** Maintain and report the cash/holdings ledger separately.
+
+These comparisons evaluate observed continuation against a fixed no-more-trading baseline. They do not replay a policy with the original action removed, and they do not isolate the marginal causal value of a particular order. Later portfolio choices can influence several overlapping decision windows. Coverage and the baseline convention therefore remain material research limitations.
+
+Validation selects a checkpoint using recorded-execution account return minus a maximum-drawdown penalty: `ledger_return − selection_drawdown_weight × max_drawdown`. The weight defaults to 0.5 and is configured by `--selection-drawdown-weight`. This prevents a high sum of overlapping action feedback from being mistaken for successful portfolio performance. The ledger is still conditional on historical matching, not a causal live-strategy return.
+
+Feedback is unavailable until its full horizon has matured. Training rewards, matching windows and future marks remain inside the training partition. Bounded training chunks default to 128 bars and begin with a fresh funded account; weights update after each rollout. These resets limit long-duration inventory learning and must be considered when interpreting results. The final horizon bars in every chunk/partition are reserved for feedback observation rather than new decisions. Validation uses frozen weights and may select a checkpoint; held-out data never updates policy parameters. Feature schemas and scaling use the training prefix only. A later mark can affect evaluator feedback after maturity but cannot enter an earlier policy observation.
+
+Chronological splitting limits leakage but does not demonstrate generalization. Overlapping action horizons create statistical dependence, and repeated validation selection can overfit. Purged walk-forward experiments and untouched final test periods remain necessary for a market-performance claim.
+
+## Historical matching and selection bias
+
+Each proposed execution needs a compatible recorded event within a bounded subsequent window. Preserve symbol, mode, side, price constraints, exact quantity and quote/regime evidence. Aggressive analogs share aggressor side; passive analogs need attributed queue progression. The earliest compatible record is selected without evaluating later profitability. A missing match creates abstention, not a bar-price fill.
+
+For example, an aggressive proposal to buy 100 shares at a $225 limit requires a compatible recorded buy-aggressor execution of 100 shares at or below $225 after assumed arrival, with supporting quote and regime context. A close price of $224 or aggregate volume of 10,000 does not establish an execution. The CLI requires exact quantity; a lower-level API can permit smaller near-size analogs while keeping their actual size.
+
+The policy receives economic feedback only for supported actions. Consequently, it learns from a selected subset of actions and regimes: exact-quantity records, liquidity and data coverage affect what can be rewarded. A high shaped reward with low matching coverage can be misleading. An unsupported action is not a proven bad trade, so it receives no invented economic penalty. Hard-constraint violations can carry an explicitly separate policy cost.
+
+Historical analogs do not identify causal market impact. An inserted order can displace orders, reveal information or trigger responses that are absent from the record. The account is a conditional counterfactual estimate, and matched execution evidence does not turn it into realized or executable strategy returns.
 
 ## Interpreting a report
 
 Assess these together:
 
-- The number of proposals, supported analogs and abstentions, including reasons for rejection.
-- Match price, size, time distance, and record reuse protections.
-- Net portfolio estimates after explicit costs, with drawdown and exposure history.
-- Trades and periods where risks forced a smaller allocation or blocked an order.
-- Sensitivity to match tolerances, execution delay, costs and available liquidity.
+- Proposed dollar actions, constrained quantities and reasons for any reduction or rejection.
+- Supported analogs, unmatched actions, coverage, matching distances and source record IDs.
+- Mature economic feedback, the horizon reserved for observing it and separate constraint costs.
+- The independently marked account ledger, explicit execution fees, exposure and drawdown.
+- Results by stock, regime, holding period and action side, including data availability.
+- Sensitivity to reward horizon/weights, execution latency, costs and matching tolerances.
 
-Portfolio marks at bar closes are valuation assumptions, not execution evidence. Returns from a selected set of matching trades do not describe unsupported proposals or opportunity costs automatically. Report calendar time and cash holdings as well as traded intervals. The baseline ledger includes a one-basis-point execution fee and reports estimated slippage separately; it does not model settlement, taxes, borrow, financing or all venue fees.
+Keep shaped feedback separate from net portfolio estimates. The pipeline's one-basis-point execution fee reduces ledger cash and thus is already included in portfolio feedback; it is not subtracted twice. The standalone per-share `evaluate_action` diagnostic uses a configurable five-basis-point fee by default and does not trace subsequent portfolio trades; active training uses `evaluate_portfolio_action`. Spread enters recorded execution prices. Settlement, taxes, borrow, financing, dividends and all venue charges are not modeled. A reported close-based account value is a valuation assumption, not evidence that it could be liquidated at that price.
 
-The offline synthetic demo is a software integration check. Its generated price paths, executions and news do not measure predictive ability, liquidity realism or future returns. Do not use demo performance to select an investment strategy.
+The synthetic demo validates software integration, minute/second input handling and feedback mechanics. Its paths, executions and news cannot establish learning quality, liquidity realism or future profitability.
 
 ## Validation before expanding scope
 
-A credible research program needs more than a chronological split:
+1. Use purged walk-forward evaluation with boundaries/embargoes covering lookbacks, execution windows and full reward horizons.
+2. Test across market regimes and unseen securities, using the historical investable universe including delisted stocks.
+3. Compare cash, constrained buy-and-hold and transparent action rules under the same execution-evidence requirements.
+4. Examine reward-hacking behavior: unnecessary churn, collecting overlapping avoided-loss rewards, exploiting tiny actions or trading only well-covered events.
+5. Include consistent corporate action handling and provider-specific costs; quantify uncertainty and sensitivity instead of reporting one best result.
+6. Validate full depth and order lifecycle adapters before queue claims, and a structural impact model before causal impact claims.
+7. Stress test gaps, halts, stale information, missing liquidity, correlated losses, distribution shifts and source failures.
 
-1. Use purged walk-forward evaluation with embargoes sufficient for feature lookbacks, target horizons and execution windows. Check for overlap between training targets and evaluation periods.
-2. Evaluate across symbols and market regimes, including unseen securities and periods of stress. Reconstruct the historical universe rather than selecting today's survivors.
-3. Compare against transparent baselines such as cash, constrained buy-and-hold and a simple non-neural allocation rule under the same execution evidence requirements.
-4. Include fees, spread, financing where applicable, corporate actions and provider-specific execution assumptions. Measure uncertainty and sensitivity rather than reporting one best return.
-5. Add full depth order lifecycle data and validated venue adapters before claiming queue realism. Use probabilistic fill and impact models with calibrated uncertainty for unsupported counterfactual effects.
-6. Review model stability, distribution shifts, text source reliability, data revisions and operational faults. Stress test volatility jumps, gaps, halts, stale data and unavailable liquidity.
+Useful extensions include provider-backed history, finer action sizing, calibrated portfolio stress controls, semantic news encoding, diversified credit assignment and alternative offline policy algorithms. Continuous sizing still needs recorded execution support; expanding a dollar action does not license inventing a fill. Production broker integration requires reconciliation, monitoring and a tested kill switch.
 
-## Roadmap
-
-Useful extensions are provider-backed historical data, richer probabilistic forecasting and uncertainty, a semantic text encoder with entity linking, cross-asset portfolio risk, purged validation utilities, event-driven depth replay and measured production execution calibration. A broker integration would require a separate operational design with reconciliation, monitoring and a tested kill switch.
-
-No finite input set covers every influence on price, and no risk objective captures every loss mechanism. The current modules make assumptions explicit so they can be tested and replaced as better data and evidence become available.
+No finite input set covers every price influence or risk. The modules expose assumptions so experiments can test and replace them as better evidence becomes available.

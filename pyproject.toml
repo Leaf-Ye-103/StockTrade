@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stocktrade-research"
-version = "0.1.0"
-description = "Point-in-time multimodal learning and observed-trade execution research"
+version = "0.2.0"
+description = "Direct portfolio policies trained from observed execution and outcome feedback"
 requires-python = ">=3.11"
 dependencies = ["numpy>=1.26,<3", "torch>=2.5,<3", "defusedxml>=0.7,<1"]
 

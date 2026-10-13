@@ -1,15 +1,17 @@
 # Data contracts
 
-The import workflow accepts normalized CSV bars and an optional JSON Lines information stream. Execution evaluation also needs recorded trades. Use timezone-aware UTC timestamps with `Z` or `+00:00`. All examples here are illustrative, not historical market records.
+The import workflow accepts normalized CSV bars and an optional JSON Lines information stream. Training and historical evaluation also require recorded trades: these supply supported execution evidence for action feedback. Funding, permitted symbols and current cash/holdings are separate policy inputs. Use timezone-aware UTC timestamps with `Z` or `+00:00`. All examples here are illustrative, not historical market records.
 
 ## Bars
 
-A bar timestamp is the **end** of its interval, when its OHLCV is available. Use an intentional, consistent positive interval for a run, such as one minute or one second. The feature builder accepts strictly increasing timestamps but does not enforce a fixed duration. Session breaks, missing intervals and trading halts need explicit preprocessing and interpretation: the baseline predicts the next input row, whose elapsed time can differ across a gap. A one-second bar is still an aggregate: it does not reconstruct the sequence of quotes and executions inside that second.
+A bar timestamp is the **end** of its interval, when its OHLCV is available. Use an intentional, consistent positive interval for a run, such as one minute or one second. Each stock's timestamps must increase strictly, and all checkpoint stocks must have exactly matching timestamp sequences; misaligned data is rejected rather than padded. Session breaks, missing intervals and trading halts need explicit preprocessing and interpretation: lookbacks and reward horizons count input observations, whose elapsed time can differ across a gap. A one-second bar is still an aggregate: it does not reconstruct the sequence of quotes and executions inside that second.
 
 ```csv
 timestamp,symbol,open,high,low,close,volume,bid,ask,bid_size,ask_size
 2025-01-02T14:31:00Z,NVDA,100.00,100.10,99.95,100.05,1200,100.04,100.06,300,250
+2025-01-02T14:31:00Z,MSFT,400.00,400.20,399.95,400.05,1600,400.04,400.06,400,350
 2025-01-02T14:32:00Z,NVDA,100.05,100.15,100.00,100.10,900,100.09,100.11,200,350
+2025-01-02T14:32:00Z,MSFT,400.05,400.25,400.00,400.10,1800,400.09,400.11,450,350
 ```
 
 | Field | Meaning |
@@ -22,6 +24,20 @@ timestamp,symbol,open,high,low,close,volume,bid,ask,bid_size,ask_size
 | `bid_size`, `ask_size` | Optional displayed quantities corresponding to the quote. |
 
 An absent optional field represents missing information. Bid/ask sizes provide a top-of-book imbalance proxy, not queue position or full market depth. Avoid mixed currencies or mixed split adjustment conventions.
+
+## Funding and holdings
+
+Pass positive initial funding and the permitted stock symbols through `--funding` and `--symbols`. Funding is both an account input and the fixed scale for action budgets and reward normalization. The default action bins are 1%, 5%, 10% and 20% of that amount. The policy may buy or sell only allowed symbols; it cannot short stocks. Inference may restrict the trained universe to a subset, but expanding it requires retraining. Bars for all checkpoint stocks remain necessary to produce its account and cross-stock context.
+
+For `stocktrade act`, an optional `--holdings` JSON file maps symbols to nonnegative whole-share quantities:
+
+```json
+{"NVDA": 100, "MSFT": 20}
+```
+
+Supply actual remaining cash using `--cash` when supplying holdings. Every held stock requires an observed current mark for account valuation. Without initial holdings, a new account begins with its funding in cash. Action inference consumes historical observations only and does not require a future trade ledger. Training and historical evaluation need a ledger because unsupported actions cannot generate economic feedback.
+
+Proposed dollar values are gross execution budgets before fees, not share counts or guaranteed fills. Risk sizing rounds down to whole shares using observed quote prices and account limits. A $100 proposal for a stock above $100 can therefore produce no executable quantity; fractional fills are not synthesized.
 
 ## Information events
 
