@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import heapq
 import json
 import math
 import re
@@ -18,7 +19,7 @@ import urllib.parse
 import urllib.request
 import urllib.robotparser
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Iterable
@@ -30,7 +31,15 @@ from defusedxml.common import DefusedXmlException
 from .schemas import FeatureFrame, InformationEvent, MarketBar
 
 NEWS_HASH_DIM = 16
-_EVENT_KINDS = {"macro", "market", "fundamentals", "news", "orderflow"}
+PLATFORM_VALUE_KEYS = (
+    "last_price", "market_cap", "trailing_pe", "forward_pe", "price_to_book",
+    "dividend_yield", "analyst_target_price", "analyst_recommendation",
+    "short_float_fraction", "short_interest_ratio", "implied_volatility",
+    "borrow_rate", "borrow_available", "retail_sentiment", "discussion_volume",
+)
+PLATFORM_METRICS = PLATFORM_VALUE_KEYS
+DEFAULT_INFORMATION_MAX_AGE_SECONDS = {"orderflow": 60.0, "platform": 3600.0}
+_EVENT_KINDS = {"macro", "market", "fundamentals", "news", "orderflow", "platform"}
 _BAR_COLUMNS = ("timestamp", "symbol", "open", "high", "low", "close", "volume")
 _QUOTE_COLUMNS = ("bid", "ask", "bid_size", "ask_size")
 _MAX_RESPONSE_BYTES = 2_000_000
@@ -86,6 +95,9 @@ def _validate_bar(bar: MarketBar) -> None:
 def _validate_event(event: InformationEvent) -> None:
     _utc(event.published_at, "published_at")
     _utc(event.available_at, "available_at")
+    if event.expires_at is not None:
+        if _utc(event.expires_at, "expires_at") <= event.published_at:
+            raise ValueError("expires_at must be later than published_at")
     if event.kind not in _EVENT_KINDS:
         raise ValueError(f"unsupported information kind {event.kind!r}; expected one of {sorted(_EVENT_KINDS)}")
     if not isinstance(event.source, str) or not event.source.strip():
@@ -135,8 +147,9 @@ def load_events_jsonl(path: str | Path) -> list[InformationEvent]:
     """Load news, macro/benchmark, and fundamental releases with provenance.
 
     Example kinds are ``macro`` (policy_rate), ``market`` (benchmark_return),
-    ``fundamentals`` (revenue), ``news`` (text), and ``orderflow`` (provider-measured
-    L2 depth, queue, or trade-flow aggregates). ``available_at`` is required:
+    ``fundamentals`` (revenue), ``news`` (text), ``platform`` (investment-platform
+    snapshots), and ``orderflow`` (provider-measured L2 depth, queue, or trade-flow
+    aggregates). ``available_at`` is required:
     publication timestamps alone do not establish historical data availability.
     Order-flow measurements require a real source and retain that source's
     aggregation interval; OHLCV is never used to reconstruct queue priority.
@@ -153,6 +166,8 @@ def load_events_jsonl(path: str | Path) -> list[InformationEvent]:
                     available_at=_parse_timestamp(row["available_at"], "available_at"),
                     source=row["source"], kind=row["kind"], values=row.get("values", {}),
                     text=row.get("text", ""), symbol=row.get("symbol"),
+                    expires_at=(_parse_timestamp(row["expires_at"], "expires_at")
+                                if row.get("expires_at") is not None else None),
                 )
                 _validate_event(event)
             except (KeyError, TypeError, ValueError) as exc:
@@ -182,13 +197,19 @@ def _event_column(event: InformationEvent, key: str) -> str:
 
 
 def build_features(bars: Iterable[MarketBar], events: Iterable[InformationEvent], *,
-                   feature_names: list[str] | None = None) -> FeatureFrame:
+                   feature_names: list[str] | None = None,
+                   information_max_age_seconds: dict[str, float] | None = None,
+                   as_of: datetime | None = None) -> FeatureFrame:
     """Construct single-symbol features using only information available then.
 
     Feature values are finite and missing entries are zero with ``observed=False``.
     No queue depth, trade direction, or fill availability is inferred from OHLCV.
     News decays over six hours from *availability*, avoiding stale-news timing
-    leakage. Fundamental, macro, and externally measured order-flow values
+    leakage. Explicit ``expires_at`` boundaries invalidate every information
+    kind. Order-flow/platform snapshots expire after at most 60/3600 seconds
+    from publication, even when their explicit expiry is later; collection cannot
+    renew an old measurement. ``information_max_age_seconds`` can override these
+    defaults or set a fallback TTL for other kinds. Macro/fundamentals otherwise
     persist until a newer known release. Providers must timestamp order-flow
     observations at their aggregation end, and explicitly supply subsequent
     measurements; these inputs cannot establish historical fills by themselves.
@@ -196,9 +217,34 @@ def build_features(bars: Iterable[MarketBar], events: Iterable[InformationEvent]
     Freeze ``feature_names`` from the training prefix for later evaluation. The
     exact requested order is retained, additional event keys are ignored, and
     requested columns absent from this dataset contain zero with a false mask.
+
+    For a current decision, ``as_of`` may advance only the final feature clock
+    beyond the latest completed bar. Raw bar timestamps, OHLCV, returns, and
+    prices remain unchanged; no synthetic market observation is appended.
+    Historical training/evaluation should omit this current-clock override.
     """
+    max_ages = dict(DEFAULT_INFORMATION_MAX_AGE_SECONDS)
+    if information_max_age_seconds is not None:
+        if not isinstance(information_max_age_seconds, dict):
+            raise ValueError("information_max_age_seconds must be a kind-to-seconds dictionary")
+        for kind, seconds in information_max_age_seconds.items():
+            if kind not in _EVENT_KINDS or _finite(seconds, "information max age") <= 0:
+                raise ValueError("information max ages must use recognized kinds and positive finite seconds")
+            max_ages[kind] = float(seconds)
+
+    def expiry_for(event: InformationEvent) -> datetime | None:
+        if event.expires_at is not None:
+            explicit = _utc(event.expires_at, "expires_at")
+            if event.kind in {"orderflow", "platform"}:
+                maximum = _utc(event.published_at, "published_at") + timedelta(seconds=max_ages[event.kind])
+                return min(explicit, maximum)
+            return explicit
+        if event.kind in max_ages:
+            return _utc(event.published_at, "published_at") + timedelta(seconds=max_ages[event.kind])
+        return None
+
     frozen_names = None
-    allowed_groups = {"market", "orderbook", "macro", "fundamentals", "news"}
+    allowed_groups = {"market", "orderbook", "macro", "fundamentals", "news", "platform"}
     if feature_names is not None:
         if not isinstance(feature_names, list) or not feature_names:
             raise ValueError("feature_names must be a nonempty list")
@@ -225,6 +271,11 @@ def build_features(bars: Iterable[MarketBar], events: Iterable[InformationEvent]
     times = [_utc(bar.timestamp, "bar timestamp") for bar in bar_list]
     if any(left >= right for left, right in zip(times, times[1:])):
         raise ValueError("bar timestamps must be unique for the symbol")
+    if as_of is not None:
+        decision_time = _utc(as_of, "as_of")
+        if decision_time < times[-1]:
+            raise ValueError("as_of cannot precede the latest completed bar")
+        times[-1] = decision_time
     applicable = [event for event in event_list if event.symbol in (None, symbol)]
     applicable.sort(key=lambda event: (max(event.published_at, event.available_at), event.published_at))
 
@@ -249,13 +300,21 @@ def build_features(bars: Iterable[MarketBar], events: Iterable[InformationEvent]
     register("fundamentals", fundamental_keys)
     register("news", [f"news.hash_{index:02d}" for index in range(NEWS_HASH_DIM)]
                        + ["news.decayed_count", "news.log_seconds_since_latest"])
+    # These canonical fields exist before any collection, keeping checkpoints
+    # ready for newly observed platform data without discovering future keys.
+    platform_keys = {f"platform.{key}" for key in PLATFORM_VALUE_KEYS}
+    platform_keys.update(_event_column(event, key) for event in applicable if event.kind == "platform"
+                         for key in event.values if frozen_set is None or _event_column(event, key) in frozen_set)
+    register("platform", sorted(platform_keys))
     columns = {name: index for index, name in enumerate(names)}
     values = np.zeros((len(bar_list), len(names)), dtype=np.float32)
     observed = np.zeros_like(values, dtype=bool)
-    persistent: dict[str, tuple[datetime, datetime, float]] = {}
+    persistent: dict[tuple[str, str], tuple[datetime, datetime, datetime | None, float | None]] = {}
     news_vector = np.zeros(NEWS_HASH_DIM, dtype=np.float64)
     news_count = 0.0
-    latest_news_at: datetime | None = None
+    active_news: dict[int, tuple[datetime, np.ndarray]] = {}
+    news_expirations: list[tuple[datetime, int]] = []
+    news_latest: list[tuple[float, int]] = []
     cursor = 0
 
     for row, (bar, timestamp) in enumerate(zip(bar_list, times)):
@@ -290,23 +349,46 @@ def build_features(bars: Iterable[MarketBar], events: Iterable[InformationEvent]
             if usable_at > timestamp:
                 break
             if event.kind == "news":
-                news_decay = math.exp(-(timestamp - usable_at).total_seconds() / (6 * 3600))
-                news_vector += news_decay * _hashed_text(event.text)
-                news_count += news_decay
-                latest_news_at = usable_at
+                expiry = expiry_for(event)
+                if expiry is None or timestamp < expiry:
+                    encoded = _hashed_text(event.text)
+                    news_decay = math.exp(-(timestamp - usable_at).total_seconds() / (6 * 3600))
+                    news_vector += news_decay * encoded
+                    news_count += news_decay
+                    active_news[cursor] = (usable_at, encoded)
+                    heapq.heappush(news_latest, (-usable_at.timestamp(), cursor))
+                    if expiry is not None:
+                        heapq.heappush(news_expirations, (expiry, cursor))
             else:
                 for key, value in event.values.items():
-                    if value is None:
-                        continue
                     name = _event_column(event, key)
-                    previous_release = persistent.get(name)
-                    release_order = (event.published_at, event.available_at)
+                    source_key = (name, event.source)
+                    previous_release = persistent.get(source_key)
+                    release_order = (_utc(event.published_at, "published_at"), _utc(event.available_at, "available_at"))
                     if previous_release is None or release_order >= previous_release[:2]:
-                        persistent[name] = (*release_order, _finite(value, name))
+                        persistent[source_key] = (*release_order, expiry_for(event),
+                                                  _finite(value, name) if value is not None else None)
             cursor += 1
-        for name, (_, _, value) in persistent.items():
-            put(name, value)
-        if latest_news_at is not None:
+        latest_values = {}
+        for (name, source), snapshot in persistent.items():
+            # Retain expired/new-null snapshots as tombstones: an older delayed
+            # release must not resurrect an invalidated value, even cross-source.
+            release_order = (*snapshot[:2], source)
+            if name not in latest_values or release_order > latest_values[name][0]:
+                latest_values[name] = (release_order, snapshot)
+        for name, (_, (_, _, expiry, value)) in latest_values.items():
+            if value is not None and (expiry is None or timestamp < expiry):
+                put(name, value)
+        while news_expirations and news_expirations[0][0] <= timestamp:
+            _, article = heapq.heappop(news_expirations)
+            available, encoded = active_news.pop(article)
+            decay = math.exp(-(timestamp - available).total_seconds() / (6 * 3600))
+            news_vector -= decay * encoded
+            news_count = max(0.0, news_count - decay)
+        while news_latest and news_latest[0][1] not in active_news:
+            heapq.heappop(news_latest)
+        if news_latest:
+            latest_news_at = active_news[news_latest[0][1]][0]
             vector = news_vector / max(news_count, 1e-12)
             for index, value in enumerate(vector):
                 put(f"news.hash_{index:02d}", float(value))
@@ -362,13 +444,20 @@ def _read_https(opener, url: str, user_agent: str, timeout: float) -> bytes:
 
 def collect_rss(url: str, output_path: str | Path, *, symbol: str | None = None,
                 timeout: float = 15.0, user_agent: str = "StockTradeResearch/0.1",
-                max_articles: int = 250) -> int:
+                max_articles: int = 250, ttl_seconds: float | None = 86400.0,
+                require_publication_time: bool = True) -> int:
     """Fetch one permitted HTTPS RSS/Atom feed and append provenance-rich JSONL.
 
     This bounded collector performs a robots request and a feed request, respects
     TLS verification, and refuses cross-origin or HTTP redirects. It does not
     crawl article pages or bypass paywalls. Newly collected news is available
-    now, even when a feed gives an earlier publication date.
+    now, even when a feed gives an earlier publication date. Articles expire
+    after ``ttl_seconds`` from publication (one day by default); already expired
+    items are skipped. Explicit ``ttl_seconds=None`` allows archival collection
+    while preserving actual collection time as the availability boundary.
+    Undated entries are skipped by default, preventing repeated collection from
+    making an old article appear newly published. Explicit legacy estimation
+    via ``require_publication_time=False`` is marked in the saved provenance.
     """
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
@@ -377,6 +466,10 @@ def collect_rss(url: str, output_path: str | Path, *, symbol: str | None = None,
         raise ValueError("timeout must be between 0 and 60 seconds")
     if not isinstance(max_articles, int) or isinstance(max_articles, bool) or not 1 <= max_articles <= 1000:
         raise ValueError("max_articles must be between 1 and 1000")
+    if ttl_seconds is not None and _finite(ttl_seconds, "ttl_seconds") <= 0:
+        raise ValueError("ttl_seconds must be positive")
+    if not isinstance(require_publication_time, bool):
+        raise ValueError("require_publication_time must be a boolean")
     if not user_agent.strip() or "\n" in user_agent or "\r" in user_agent:
         raise ValueError("a valid crawler User-Agent is required")
     if symbol is not None and (not isinstance(symbol, str) or not symbol.strip()):
@@ -421,6 +514,8 @@ def collect_rss(url: str, output_path: str | Path, *, symbol: str | None = None,
         if not text:
             continue
         date_text = fields.get("pubDate") or fields.get("published") or fields.get("updated")
+        if not date_text and require_publication_time:
+            continue
         published = collected
         if date_text:
             try:
@@ -430,8 +525,13 @@ def collect_rss(url: str, output_path: str | Path, *, symbol: str | None = None,
                     published = _utc(parsedate_to_datetime(date_text), "feed publication time")
                 except (TypeError, ValueError, OverflowError) as exc:
                     raise ValueError(f"feed item has an invalid publication time: {date_text!r}") from exc
+        expiry = published + timedelta(seconds=ttl_seconds) if ttl_seconds is not None else None
+        if expiry is not None and expiry <= collected:
+            continue
         rows.append({"published_at": published.isoformat(), "available_at": collected.isoformat(),
-                     "source": url, "kind": "news", "values": {}, "text": text, "symbol": symbol})
+                     "source": url, "kind": "news", "values": {}, "text": text, "symbol": symbol,
+                     "expires_at": expiry.isoformat() if expiry is not None else None,
+                     "publication_time_estimated": not bool(date_text)})
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("a", encoding="utf-8") as stream:

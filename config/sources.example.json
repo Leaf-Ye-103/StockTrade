@@ -1,0 +1,41 @@
+{
+  "user_agent": "StockTradeResearch/0.3",
+  "sources": [
+    {
+      "name": "yahoo-ticker-news",
+      "provider": "Yahoo Finance",
+      "type": "rss",
+      "url": "https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US",
+      "refresh_seconds": 300,
+      "max_age_seconds": 86400,
+      "max_articles": 50,
+      "request_timeout": 15
+    },
+    {
+      "name": "fed-policy-news",
+      "provider": "Federal Reserve",
+      "type": "rss",
+      "url": "https://www.federalreserve.gov/feeds/press_monetary.xml",
+      "refresh_seconds": 900,
+      "max_age_seconds": 604800,
+      "max_articles": 50,
+      "request_timeout": 15
+    },
+    {
+      "name": "alpaca-snapshot",
+      "provider": "Alpaca",
+      "type": "json",
+      "enabled": false,
+      "url": "https://data.alpaca.markets/v2/stocks/{symbol}/snapshot",
+      "refresh_seconds": 15,
+      "max_age_seconds": 60,
+      "request_timeout": 15,
+      "headers_env": {
+        "APCA-API-KEY-ID": "APCA_API_KEY_ID",
+        "APCA-API-SECRET-KEY": "APCA_API_SECRET_KEY"
+      },
+      "metrics": {"last_price": "latestTrade.p"},
+      "published_at_path": "latestTrade.t"
+    }
+  ]
+}

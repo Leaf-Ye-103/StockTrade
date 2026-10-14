@@ -3,24 +3,26 @@
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections import Counter, deque
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import asdict
-from datetime import datetime
+from dataclasses import replace
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import torch
 
-from .action_risk import constrain_action
+from .action_risk import ActionDecision, constrain_action
 from .data import build_features, load_bars_csv, load_events_jsonl
 from .execution import MatchingConfig, OrderIntent, PortfolioLedger, load_trades_csv, match_order
 from .model import PolicyAgent, PolicyConfig
 from .policy_contracts import PortfolioState
-from .rewards import PortfolioObservation, RewardConfig, evaluate_action, evaluate_portfolio_action
+from .objective import evaluate_episode
 from .risk import MarketState, RiskConfig
 
 
@@ -80,9 +82,11 @@ def _funding(value):
     return float(value)
 
 
-def load_market(bars_path, events_path=None, symbols=None, *, schemas=None, train_end=None):
+def load_market(bars_path, events_path=None, symbols=None, *, schemas=None, train_end=None,
+                extra_events=None, as_of=None):
     rows = load_bars_csv(bars_path)
     events = load_events_jsonl(events_path) if events_path else []
+    events.extend(extra_events or [])
     universe = _symbols(symbols, {bar.symbol for bar in rows})
     bars = {symbol: [] for symbol in universe}
     for bar in rows:
@@ -102,7 +106,7 @@ def load_market(bars_path, events_path=None, symbols=None, *, schemas=None, trai
             cutoff = timestamps[train_end - 1]
             known = [event for event in events if max(event.published_at, event.available_at) <= cutoff]
             schema = build_features(bars[symbol][:train_end], known).feature_names
-        frames[symbol] = build_features(bars[symbol], events, feature_names=schema)
+        frames[symbol] = build_features(bars[symbol], events, feature_names=schema, as_of=as_of)
     return bars, frames
 
 
@@ -129,87 +133,54 @@ def _trade_index(prints, universe):
     return groups, {symbol: [record.timestamp for record in records] for symbol, records in groups.items()}
 
 
-def _action_advantages(records):
-    """Use each mature portfolio advantage once; never sum shaped advantages.
+def rollout(agent, bars, frames, prints, *, start, stop, funding,
+            allowed_symbols=None, training=False, risk_config=None):
+    """Replay a full portfolio episode; the sole signal is terminal net wealth.
 
-    Crediting a later sale's avoided-loss reward to its preceding bad purchase
-    could reward deliberate loss/rescue cycles. Actual future equity already
-    accounts for subsequent matched actions in each decision's own comparison.
-    """
-    return {position: record["feedback"]["reward"] for position, record in enumerate(records)
-            if record["feedback"]["reward"] is not None}
-
-
-def rollout(agent, bars, frames, prints, *, start, stop, funding, reward_config,
-            allowed_symbols=None, training=False, constraint_penalty=.001):
-    """One bounded chronological episode. Never update weights during a rollout.
-
-    Decisions stop H bars before the partition end. Pending feedback matures
-    only once all H later observations have actually been reached. Later data
-    never trains an earlier checkpoint across a partition boundary.
+    No decision is scored separately. Risk-rejected requests are known no-ops,
+    and unsupported execution has unknown status, never a fabricated fill.
+    Incomplete or risk-inadmissible trajectories are not used for learning.
+    The final bar only values existing holdings; no unobserved exit is assumed.
     """
     allowed = _symbols(allowed_symbols, set(agent.universe))
-    if not agent.config.lookback - 1 <= start < stop <= len(frames[agent.universe[0]].timestamps):
-        raise ValueError("Rollout must have a historical window and a valid exclusive end")
-    risk = RiskConfig()
+    timestamps = frames[agent.universe[0]].timestamps
+    if not agent.config.lookback - 1 <= start < stop - 1 < len(timestamps):
+        raise ValueError("Rollout needs a past window and at least two complete episode bars")
+    risk = risk_config or RiskConfig()
     matching = MatchingConfig(size_tolerance=0.0)
-    ledger = PortfolioLedger(initial_cash=funding, fee_bps=reward_config.fee_bps)
+    ledger = PortfolioLedger(initial_cash=funding, fee_bps=risk.commission_bps)
     trade_groups, trade_times = _trade_index(prints, agent.universe)
-    records, samples, pending, observations = [], {}, deque(), {}
+    records, samples = [], []
     reasons = Counter()
     peak, day_start, current_day = funding, funding, None
-    timestamps = frames[agent.universe[0]].timestamps
-
-    def mature(current_index):
-        while pending and pending[0][0] + reward_config.horizon_steps <= current_index:
-            decision_index, position, action, match, before = pending.popleft()
-            future = [observations[j]
-                      for j in range(decision_index + 1, decision_index + reward_config.horizon_steps + 1)]
-            supporting = tuple(source_id for ledger_record in ledger.records
-                if ledger_record.status == "matched"
-                and timestamps[decision_index] < ledger_record.match.event_timestamp <= future[-1].timestamp
-                for source_id in ledger_record.match.source_trade_ids)
-            feedback = evaluate_portfolio_action(action, match,
-                decision_timestamp=timestamps[decision_index], initial_funding=funding,
-                cash_before=before.cash, holdings_before=before.holdings, equity_before=before.equity,
-                future_observations=future, config=reward_config, supporting_trade_ids=supporting)
-            records[position]["feedback"] = asdict(feedback)
-
     for index in range(start, stop):
         timestamp = timestamps[index]
         for symbol in agent.universe:
             ledger.mark(timestamp, symbol, float(frames[symbol].prices[index]))
-        observations[index] = PortfolioObservation(timestamp, ledger.equity,
-            {symbol: float(frames[symbol].prices[index]) for symbol in agent.universe})
         peak = max(peak, ledger.equity)
-        if current_day != timestamp.date():
-            current_day, day_start = timestamp.date(), ledger.equity
-        mature(index)
-        if index + reward_config.horizon_steps >= stop:
+        date = timestamp.astimezone(ZoneInfo("America/New_York")).date()
+        if current_day != date:
+            current_day, day_start = date, ledger.equity
+        if index == stop - 1:
             continue
         state = PortfolioState(funding, ledger.cash, dict(ledger.positions),
             {symbol: float(frames[symbol].prices[index]) for symbol in agent.universe}, peak, day_start)
         with torch.set_grad_enabled(training):
             sample = agent.act(frames, index, state, deterministic=not training, allowed_symbols=allowed)
         action = sample.action
-        quotes = _quotes(agent, bars, frames, index)
-        decision = constrain_action(action, state, quotes, allowed, risk)
+        decision = constrain_action(action, state, _quotes(agent, bars, frames, index), allowed, risk)
         record = dict(timestamp=timestamp, bar_index=index, policy_action=asdict(action),
             probability=float(sample.log_probability.detach().exp()), feasibility=asdict(decision),
             account_before=dict(equity=state.equity, cash=state.cash, holdings=dict(state.holdings)))
-        position = len(records)
         records.append(record)
         if training:
-            samples[position] = sample
+            samples.append(sample)
         reasons.update(decision.reasons)
         if not decision.accepted:
-            record["feedback"] = dict(status="constraint", reward=-constraint_penalty,
-                maturity_timestamp=timestamp, source_trade_ids=(),
-                components={"constraint_cost": -constraint_penalty},
-                baseline_description="Known risk/feasibility violation; no invented execution or economic loss")
+            record["transition"] = "risk_rejected_no_order"
             continue
         if action.side == "hold":
-            pending.append((index, position, action, None, state))
+            record["transition"] = "hold"
             continue
         symbol = action.symbol
         bar = bars[symbol][index]
@@ -223,117 +194,103 @@ def rollout(agent, bars, frames, prints, *, start, stop, funding, reward_config,
         match = match_order(intent, trade_groups[symbol][lo:hi], matching, used_trade_ids=ledger.used_trade_ids)
         accounting = ledger.apply_match(intent, match)
         record.update(intent=asdict(intent), analog=asdict(match), accounting=asdict(accounting),
+            transition=accounting.status,
             effective_action=dict(symbol=symbol, side=action.side, value=decision.notional, quantity=decision.quantity))
-        if accounting.status == "matched":
-            pending.append((index, position, action, match, state))
-        else:
-            record["feedback"] = asdict(evaluate_action(action, None, decision_timestamp=timestamp,
-                decision_price=bar.close, future_marks=[], initial_funding=funding,
-                equity_before=state.equity, config=reward_config))
-    if pending:
-        raise RuntimeError("Unmatured feedback at episode boundary; no truncated horizon is allowed")
-    advantages = _action_advantages(records)
-    eligible = [position for position in range(len(records)) if position in advantages]
-    ledger_result = asdict(ledger.result())
-    economic_rewards = [record["feedback"]["reward"] for record in records
-                        if record["feedback"]["status"] == "supported"]
-    constraint_rewards = [record["feedback"]["reward"] for record in records
-                          if record["feedback"]["status"] == "constraint"]
-    supported_trades = sum(record["feedback"]["status"] == "supported"
-                           and record["policy_action"]["side"] != "hold" for record in records)
+    objective = evaluate_episode(funding, ledger.equity, equity_curve=ledger.equity_curve,
+        risk_config=risk, initial_timestamp=timestamps[start], final_timestamp=timestamps[stop - 1])
+    execution = asdict(ledger.result())
+    complete = execution["unmatched_orders"] == 0 and execution["rejected_orders"] == 0
+    eligible = objective.admissible and complete
     report = dict(
-        interpretation="Observed-execution action feedback and analog portfolio accounting; not causal impact",
+        interpretation="Terminal wealth on an observed-execution analog ledger, not causal market impact",
         universe=list(agent.universe), allowed_symbols=list(allowed), initial_funding=funding,
-        decisions=len(records), supported_trade_feedback=supported_trades,
-        economic_reward_sum=float(sum(economic_rewards)), constraint_reward_sum=float(sum(constraint_rewards)),
-        policy_reward_sum=float(sum(economic_rewards) + sum(constraint_rewards)),
-        eligible_feedback=len(eligible), unmatched_feedback=sum(r["feedback"]["status"] == "unmatched" for r in records),
-        final_equity=ledger.equity, ledger_return=ledger.equity / funding - 1,
-        execution=ledger_result, risk_reasons=dict(reasons), feedback_records=records,
-        reward_horizon=reward_config.horizon_steps,
-        reward_interpretation="Each actual portfolio path versus its frozen pre-action hold baseline; non-additive advantages",
+        decisions=len(records), matched_orders=execution["matched_orders"],
+        objective=asdict(objective), trajectory_complete=complete, learning_eligible=eligible,
+        final_equity=ledger.equity, ledger_return=objective.wealth_growth,
+        execution=execution, risk_reasons=dict(reasons), decision_records=records,
+        objective_name="terminal_net_wealth_growth", action_grading=False,
     )
-    return report, [samples[position] for position in eligible] if training else [], [advantages[p] for p in eligible]
+    return report, samples if training and eligible else [], [objective.wealth_growth] * len(samples) if training and eligible else []
 
 
 def train(bars_path, events_path, trades_path, output, *, epochs=3, seed=7, lookback=16,
-          funding=100000.0, symbols=None, reward_horizon=8, constraint_penalty=.001,
-          episode_steps=128, train_fraction=.7, validation_fraction=.15, selection_drawdown_weight=.5):
+          funding=100000.0, symbols=None, episode_steps=128,
+          train_fraction=.7, validation_fraction=.15, risk_config=None):
     funding = _funding(funding)
-    if not isinstance(epochs, int) or epochs < 1:
+    risk = risk_config or RiskConfig()
+    if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1:
         raise ValueError("Training epochs must be a positive integer")
-    if not math.isfinite(selection_drawdown_weight) or selection_drawdown_weight < 0:
-        raise ValueError("Selection drawdown weight must be finite and nonnegative")
-    if not math.isfinite(constraint_penalty) or constraint_penalty < 0:
-        raise ValueError("Constraint penalty must be finite and nonnegative")
     if not 0 < train_fraction < 1 or not 0 < validation_fraction < 1 - train_fraction:
         raise ValueError("Fractions must leave nonempty chronological train, validation and test intervals")
+    if not isinstance(episode_steps, int) or isinstance(episode_steps, bool) or episode_steps < 2:
+        raise ValueError("Episode steps must contain at least two bars")
     bars, _ = load_market(bars_path, events_path, symbols)
     universe = tuple(bars)
     total = len(bars[universe[0]])
     train_end = int(total * train_fraction)
     validation_end = int(total * (train_fraction + validation_fraction))
-    rewards = RewardConfig(horizon_steps=reward_horizon, fee_bps=1.0)
-    if (train_end <= lookback + reward_horizon or validation_end - train_end <= reward_horizon
-            or total - validation_end <= reward_horizon):
-        raise ValueError("Insufficient bars in each partition for lookback and full reward horizon")
-    if not isinstance(episode_steps, int) or episode_steps <= reward_horizon:
-        raise ValueError("Episode steps must exceed the full reward horizon")
+    if train_end <= lookback + 1 or validation_end - train_end < 2 or total - validation_end < 2:
+        raise ValueError("Insufficient bars for historical windows and complete portfolio episodes")
+    # All updates have the same declared time horizon. A short training tail is
+    # left unused rather than rewarding an easier or shorter interval.
+    episode_length = min(episode_steps, train_end - (lookback - 1))
     bars, frames = load_market(bars_path, events_path, universe, train_end=train_end)
     prints = load_trades_csv(trades_path)
     agent = PolicyAgent.create(frames, universe, train_end, funding, PolicyConfig(lookback=lookback, seed=seed))
     agent.validation_end = validation_end
     agent.validation_last_timestamp = frames[universe[0]].timestamps[validation_end - 1].isoformat()
+    agent.risk_config = asdict(risk)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     history, audit = [], []
-    best_score, best_epoch, supported = -math.inf, 0, 0
+    best_score, best_epoch, supported, updated_episodes = -math.inf, 0, 0, 0
     with _threads(agent.config.num_threads), torch.random.fork_rng():
         torch.manual_seed(seed)
         for epoch in range(epochs):
-            epoch_samples, epoch_reward = 0, 0.0
-            losses = []
+            losses, episode_reports = [], []
             agent.model.train()
-            for start in range(lookback - 1, train_end, episode_steps):
-                stop = min(start + episode_steps, train_end)
-                if stop - start <= reward_horizon:
-                    continue
-                report, samples, advantages = rollout(agent, bars, frames, prints, start=start, stop=stop,
-                    funding=funding, reward_config=rewards, training=True,
-                    constraint_penalty=constraint_penalty)
-                supported += report["supported_trade_feedback"]
+            for start in range(lookback - 1, train_end - episode_length + 1, episode_length):
+                stop = start + episode_length
+                report, samples, wealth = rollout(agent, bars, frames, prints, start=start, stop=stop,
+                    funding=funding, training=True, risk_config=risk)
+                supported += report["matched_orders"]
                 if samples:
-                    losses.append(agent.update(samples, advantages))
-                    epoch_samples += len(samples)
-                epoch_reward += report["policy_reward_sum"]
-                for record in report["feedback_records"]:
+                    losses.append(agent.update(samples, wealth))
+                    updated_episodes += 1
+                episode_reports.append({k: report[k] for k in
+                    ("objective", "trajectory_complete", "learning_eligible", "matched_orders")})
+                for record in report["decision_records"]:
                     audit.append(dict(epoch=epoch + 1, partition="train", **record))
             agent.model.eval()
             validation, _, _ = rollout(agent, bars, frames, prints, start=train_end, stop=validation_end,
-                funding=funding, reward_config=rewards, constraint_penalty=constraint_penalty)
-            score = validation["ledger_return"] - selection_drawdown_weight * validation["execution"]["max_drawdown"]
-            history.append(dict(epoch=epoch + 1, trained_samples=epoch_samples,
-                training_reward=epoch_reward, validation_portfolio_score=score,
-                validation_supported_trades=validation["supported_trade_feedback"], updates=losses))
-            if supported and score > best_score:
+                funding=funding, risk_config=risk)
+            score = validation["objective"]["wealth_growth"]
+            history.append(dict(epoch=epoch + 1, episodes=episode_reports,
+                validation_wealth_growth=score, validation_admissible=validation["learning_eligible"],
+                validation_matched_orders=validation["matched_orders"], updates=losses))
+            if updated_episodes and supported and validation["learning_eligible"] and score > best_score:
                 best_score, best_epoch = score, epoch + 1
                 agent.save(output / "model.pt")
-    if supported == 0:
-        raise ValueError("No supported economic feedback in training; supply compatible recorded trade data")
+    if not supported:
+        raise ValueError("No matched executions in training; supply compatible recorded trade data")
+    if not updated_episodes or not best_epoch:
+        raise ValueError("No complete risk-admissible train/validation trajectory; inspect coverage and risk limits")
     timestamps = frames[universe[0]].timestamps
-    metadata = dict(model_kind="direct_action_policy", format_version=2, universe=list(universe),
-        initial_funding=funding, feature_schemas={s: frames[s].feature_names for s in universe},
+    metadata = dict(model_kind="direct_wealth_policy", format_version=3, universe=list(universe),
+        training_objective="terminal_net_wealth_growth", initial_funding=funding,
+        feature_schemas={s: frames[s].feature_names for s in universe},
         train_end=train_end, validation_end=validation_end, total_bars=total,
         validation_context_sha256={s: frame_signature(frames[s], validation_end) for s in universe},
         train_end_time=timestamps[train_end - 1], validation_end_time=timestamps[validation_end - 1],
         checkpoint_sha256=file_signature(output / "model.pt"), seed=seed, selected_epoch=best_epoch,
-        training_supported_feedback=supported, reward_config=asdict(rewards),
-        selection_drawdown_weight=selection_drawdown_weight,
-        constraint_penalty=constraint_penalty, episode_steps=episode_steps,
-        purpose="Direct policy optimized from mature evaluator feedback; no prediction target or loss")
+        training_matched_orders=supported, updated_episodes=updated_episodes,
+        risk_config=asdict(risk), episode_steps=episode_length,
+        training_inputs_sha256=dict(bars=file_signature(bars_path), trades=file_signature(trades_path),
+                                   events=file_signature(events_path) if events_path else None),
+        purpose="Maximize terminal net wealth under risk constraints; no action grades or prediction loss")
     write_json(output / "model.info.json", metadata)
     write_json(output / "training.json", dict(history=history, metadata=metadata))
-    with (output / "training_feedback.jsonl").open("w") as handle:
+    with (output / "training_decisions.jsonl").open("w") as handle:
         for record in audit:
             handle.write(json.dumps(record, default=_json_default, allow_nan=False) + "\n")
     return metadata
@@ -342,8 +299,8 @@ def train(bars_path, events_path, trades_path, output, *, epochs=3, seed=7, look
 def _load_checkpoint(checkpoint):
     checkpoint = Path(checkpoint)
     metadata = json.loads(checkpoint.with_name("model.info.json").read_text())
-    if metadata.get("model_kind") != "direct_action_policy":
-        raise ValueError("Retrain the old forecast checkpoint as a direct-action policy")
+    if metadata.get("model_kind") != "direct_wealth_policy" or metadata.get("training_objective") != "terminal_net_wealth_growth":
+        raise ValueError("Retrain the old action-reward checkpoint as a terminal-wealth policy")
     if file_signature(checkpoint) != metadata["checkpoint_sha256"]:
         raise ValueError("Checkpoint and metadata are not the saved pair")
     agent = PolicyAgent.load(checkpoint)
@@ -352,6 +309,7 @@ def _load_checkpoint(checkpoint):
             or agent.initial_funding != metadata["initial_funding"]
             or agent.validation_end != metadata["validation_end"]
             or agent.validation_last_timestamp != metadata["validation_end_time"]
+            or agent.risk_config != metadata["risk_config"]
             or {s: agent.scalers[s].feature_names for s in agent.universe} != metadata["feature_schemas"]):
         raise ValueError("Checkpoint and metadata training contracts disagree")
     return agent, metadata
@@ -363,29 +321,27 @@ def evaluate(bars_path, events_path, trades_path, checkpoint, output, *, funding
     allowed = _symbols(symbols, set(agent.universe))
     bars, frames = load_market(bars_path, events_path, agent.universe, schemas=metadata["feature_schemas"])
     boundary = metadata["validation_end"]
-    if len(frames[agent.universe[0]].timestamps) - boundary <= metadata["reward_config"]["horizon_steps"]:
-        raise ValueError("Held-out evaluation needs a full reward horizon after validation")
+    if len(frames[agent.universe[0]].timestamps) - boundary < 2:
+        raise ValueError("Held-out evaluation needs two complete portfolio observations after validation")
     if any(frame_signature(frames[s], boundary) != metadata["validation_context_sha256"][s] for s in agent.universe):
         raise ValueError("Checkpoint data/schema differs from supplied point-in-time training history")
     if frames[agent.universe[0]].timestamps[boundary - 1].isoformat() != metadata["validation_end_time"]:
         raise ValueError("Validation boundary timestamp disagrees with checkpoint metadata")
-    payload = dict(metadata["reward_config"])
-    payload["horizon_fractions"], payload["horizon_weights"] = tuple(payload["horizon_fractions"]), tuple(payload["horizon_weights"])
     prints = load_trades_csv(trades_path)
+    risk = RiskConfig(**metadata["risk_config"])
     with _threads(agent.config.num_threads):
         report, _, _ = rollout(agent, bars, frames, prints, start=boundary,
             stop=len(frames[agent.universe[0]].timestamps), funding=funding,
-            reward_config=RewardConfig(**payload), allowed_symbols=allowed,
-            constraint_penalty=metadata["constraint_penalty"])
+            risk_config=risk, allowed_symbols=allowed)
     report["source_is_synthetic"] = bool(prints) and all(p.trade_id.startswith("SYNTHETIC-") for p in prints)
     report["policy_updated"] = False
     report["provenance"] = dict(checkpoint_sha256=metadata["checkpoint_sha256"],
         bars_sha256=file_signature(bars_path), trades_sha256=file_signature(trades_path),
         events_sha256=file_signature(events_path) if events_path else None,
-        reward_config=payload, risk_config=asdict(RiskConfig()), selected_epoch=metadata["selected_epoch"])
+        risk_config=asdict(risk), selected_epoch=metadata["selected_epoch"])
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    records = report.pop("feedback_records")
+    records = report.pop("decision_records")
     write_json(output / "report.json", report)
     with (output / "decisions.jsonl").open("w") as handle:
         for record in records:
@@ -393,28 +349,70 @@ def evaluate(bars_path, events_path, trades_path, checkpoint, output, *, funding
     return report
 
 
-def act(bars_path, events_path, checkpoint, *, funding=None, symbols=None, cash=None, holdings=None):
-    """Produce current direct dollar actions without any future-data evaluator."""
+def _fresh_market(timestamp, now, maximum_age):
+    if not math.isfinite(maximum_age) or maximum_age <= 0:
+        raise ValueError("Maximum market age must be positive and finite")
+    age = (now - timestamp).total_seconds()
+    if age < 0:
+        raise ValueError("Latest completed market bar is in the future")
+    if age > maximum_age:
+        raise ValueError("Market data is stale for a current online decision; refresh bars or use explicit --offline research")
+
+
+def act(bars_path, events_path, checkpoint, *, funding=None, symbols=None, cash=None, holdings=None,
+        collect=True, sources_path=None, collection_output="data/online-events.jsonl", max_market_age_seconds=900.,
+        peak_equity=None, day_start_equity=None):
+    """Acquire current information and propose actions from strictly past inputs.
+
+    Online decisions use actual wall-clock collection availability. Only the
+    final feature clock advances: the completed market bar is never retimestamped
+    or duplicated. Historical train/evaluate paths never call online collection.
+    """
     agent, metadata = _load_checkpoint(checkpoint)
     funding = _funding(metadata["initial_funding"] if funding is None else funding)
     allowed = _symbols(symbols, set(agent.universe))
     bars, frames = load_market(bars_path, events_path, agent.universe, schemas=metadata["feature_schemas"])
-    holdings = {} if holdings is None else holdings
     index = len(frames[agent.universe[0]].timestamps) - 1
-    state = PortfolioState(funding, funding if cash is None else cash, holdings,
+    market_timestamp = bars[agent.universe[0]][index].timestamp
+    if market_timestamp <= datetime.fromisoformat(metadata["validation_end_time"]):
+        raise ValueError("Policy actions must be after the checkpoint's training/validation cutoff")
+    collection_report = None
+    decision_timestamp = market_timestamp
+    if collect:
+        _fresh_market(market_timestamp, datetime.now(timezone.utc), max_market_age_seconds)
+        from .collection import collect_information
+        collection_report = collect_information(allowed, collection_output, config_path=sources_path).to_dict()
+        decision_timestamp = datetime.now(timezone.utc)
+        _fresh_market(market_timestamp, decision_timestamp, max_market_age_seconds)
+        extra = load_events_jsonl(collection_output) if Path(collection_output).exists() else []
+        bars, frames = load_market(bars_path, events_path, agent.universe,
+            schemas=metadata["feature_schemas"], extra_events=extra, as_of=decision_timestamp)
+    state = PortfolioState(funding, funding if cash is None else cash, {} if holdings is None else holdings,
         {s: float(frames[s].prices[index]) for s in agent.universe})
     if cash is None and any(state.holdings.values()):
         raise ValueError("Supply available cash separately when providing existing holdings")
-    if frames[agent.universe[0]].timestamps[index] <= datetime.fromisoformat(metadata["validation_end_time"]):
-        raise ValueError("Policy actions must be after the checkpoint's training/validation cutoff")
+    new_account = cash is None and not any(state.holdings.values())
+    for value in (peak_equity, day_start_equity):
+        if value is not None and (isinstance(value, bool) or not math.isfinite(value) or value <= 0):
+            raise ValueError("Account peak and day-start equity must be positive and finite")
+    state = replace(state,
+        peak_equity=peak_equity if peak_equity is not None else funding if new_account else None,
+        day_start_equity=day_start_equity if day_start_equity is not None else funding if new_account else None)
+    history_missing = state.peak_equity is None or state.day_start_equity is None
     with _threads(agent.config.num_threads), torch.no_grad():
         sample = agent.act(frames, index, state, deterministic=True, allowed_symbols=allowed)
-    decision = constrain_action(sample.action, state, _quotes(agent, bars, frames, index), allowed)
+    decision = constrain_action(sample.action, state, _quotes(agent, bars, frames, index), allowed,
+                                RiskConfig(**metadata["risk_config"]))
+    if history_missing and sample.action.side == "buy":
+        decision = ActionDecision(sample.action, "HOLD", 0, 0.0, ("risk_history_missing",), False)
     actions = []
     if decision.accepted and decision.quantity:
         actions.append(dict(side=sample.action.side, symbol=sample.action.symbol,
                             value=decision.notional, quantity=decision.quantity))
-    return dict(timestamp=frames[agent.universe[0]].timestamps[index], total_funding=funding,
+    return dict(timestamp=decision_timestamp, market_timestamp=market_timestamp, total_funding=funding,
         available_cash=state.cash, equity=state.equity, allowed_symbols=list(allowed),
         policy_action=asdict(sample.action), trading_actions=actions, risk_decision=asdict(decision),
+        information_collection=collection_report, online=bool(collect),
+        risk_history_status="missing" if history_missing else "new_account" if new_account else "provided",
+        account_risk_baselines=dict(peak_equity=state.peak_equity, day_start_equity=state.day_start_equity),
         execution_status="Proposal only; no broker order or unsupported historical fill")

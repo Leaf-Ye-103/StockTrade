@@ -15,13 +15,20 @@ must never train them. Every policy decision must use a strictly past window.
 
 The active model outputs direct buy/sell/hold actions with dollar budgets,
 conditioned on total funding, cash, holdings and the allowed stock universe.
-Train from mature evaluator feedback using policy gradients. Do not restore
+Train from complete portfolio terminal wealth using policy gradients. Do not restore
 price/return prediction heads, prediction losses or forecast-derived allocation.
-Buy feedback compares with keeping cash; sell feedback compares with retaining
-the same existing shares at fixed future horizons. Never shorten the horizon
-at partition boundaries or select a flattering hindsight endpoint. Keep shaped
-action rewards separate from investment profit. Unmatched executions receive
-no economic reward. Known feasibility costs must be labelled separately.
+Do not grade individual buys, sales, holds, or risk rejections. The sole
+financial objective is final net equity divided by initial funding minus one,
+over a declared complete period. Fees are already in actual ledger cash.
+Enforce risk limits separately; incomplete execution or inadmissible episodes
+are not used for learning. No invented exits or penalties. Use one terminal
+wealth signal for the full trajectory. Test evaluation never updates weights.
+
+Online sources have publication, actual availability and expiry clocks.
+Historical train/evaluate never fetch today's web into past inputs. Live act
+can collect ticker sources and advance only the final feature decision clock;
+completed bars retain their original market timestamps. Do not prioritize
+platform inputs manually; learned encoders decide information importance.
 
 Never replace unsupported execution with invented fills. Preserve observed
 trade identifiers, direction, quantity, quote context and latency. Passive

@@ -1,9 +1,10 @@
-"""Causal multi-asset action policy trained from historical evaluator feedback.
+"""Causal multi-asset actions trained to increase terminal net portfolio wealth.
 
 The actor emits HOLD or a symbol, side and monetary budget. There is no price,
 return, reconstructed-input or allocation-forecast training objective. The only
-loss is a policy gradient from observed evaluator feedback and an exploration
-regularizer. A running historical reward mean supplies a non-neural baseline.
+default loss is a trajectory policy gradient from one terminal wealth objective
+under hard risk limits. There are no separately scored buys, sales or holds.
+A running mean of prior episode wealth growth supplies a non-neural baseline.
 """
 
 from dataclasses import asdict, dataclass
@@ -25,7 +26,7 @@ class PolicyConfig:
     hidden_dim: int = 32
     budget_fractions: tuple[float, ...] = (0.01, 0.05, 0.10, 0.20)
     learning_rate: float = 0.001
-    entropy_weight: float = 0.0001
+    entropy_weight: float = 0.0
     normalize_advantages: bool = True
     advantage_scale_floor: float = 0.001
     gradient_clip: float = 1.0
@@ -130,10 +131,12 @@ class _AssetEncoder(nn.Module):
         self.fusion = nn.Sequential(nn.Linear(hidden_dim * len(groups), hidden_dim), nn.GELU())
 
     def forward(self, values: torch.Tensor, observed: torch.Tensor) -> torch.Tensor:
-        encoded = [
-            encoder(torch.cat((values[..., indices] * observed[..., indices], observed[..., indices]), dim=-1))
-            for indices, encoder in zip(self.groups.values(), self.encoders)
-        ]
+        encoded = []
+        for indices, encoder in zip(self.groups.values(), self.encoders):
+            representation = encoder(torch.cat(
+                (values[..., indices] * observed[..., indices], observed[..., indices]), dim=-1,
+            ))
+            encoded.append(representation)
         return self.fusion(torch.cat(encoded, dim=-1))
 
 
@@ -143,7 +146,7 @@ class PolicyModel(nn.Module):
     Per-asset modality encoders share a past-only GRU. Cross-asset attention
     jointly considers competing stock opportunities and current inventory.
     Its only outputs are action logits. No forecast or reward-prediction head
-    exists: perception and decisions learn directly from evaluator rewards.
+    exists: perception and decisions learn from terminal net portfolio wealth.
     """
 
     def __init__(self, groups: dict[str, dict[str, list[int]]], config: PolicyConfig):
@@ -200,10 +203,11 @@ class PolicyAgent:
     training_last_timestamp: str
     validation_end: int | None = None
     validation_last_timestamp: str | None = None
+    risk_config: dict | None = None
     _optimizer: torch.optim.Optimizer | None = None
-    reward_count: int = 0
-    reward_mean: float = 0.0
-    reward_m2: float = 0.0
+    wealth_episode_count: int = 0
+    wealth_mean: float = 0.0
+    wealth_m2: float = 0.0
 
     @classmethod
     def create(
@@ -342,21 +346,24 @@ class PolicyAgent:
     def update(
         self, samples: list[PolicySample], feedback: list[float], learning_rate: float | None = None,
     ) -> dict[str, float]:
-        """REINFORCE update from matured, observed evaluator rewards only.
+        """REINFORCE update from one complete episode's terminal net wealth.
 
-        ``feedback`` contains each action's own fixed-horizon observed advantage
-        over its no-action baseline. These overlapping, non-additive advantages
-        must never be summed into reward-to-go: credit for a later protective
-        sale must not turn a preceding harmful purchase into a rewarded action.
-        There is no price or return target. Above-baseline feedback increases
-        an action's likelihood; below-baseline feedback decreases it. Samples
-        must precede any intervening optimizer step because they retain the
-        rollout computation graphs.
+        ``feedback`` repeats the same terminal net portfolio wealth growth,
+        divided by fixed funding, for every stochastic sample of ONE episode.
+        All episode action log probabilities receive this shared objective;
+        there are no handcrafted action grades, no hold comparisons and no
+        risk-penalty terms. Risk limits are enforced by the execution driver.
+        The score-function gradient uses the sum of trajectory log probabilities
+        and a running mean/variance of prior completed episode wealth growth.
+        Samples must precede any intervening optimizer step because they retain
+        the rollout computation graphs. No future price is a training target.
         """
         if not samples or len(samples) != len(feedback):
-            raise ValueError("Feedback requires matching nonempty samples and action advantages")
+            raise ValueError("Feedback requires matching nonempty episode samples and terminal wealth values")
         if any(not math.isfinite(r) for r in feedback):
-            raise ValueError("Evaluator feedback must be finite")
+            raise ValueError("Terminal wealth feedback must be finite")
+        if any(value != feedback[0] for value in feedback):
+            raise ValueError("One episode must share one terminal wealth objective; action grades are unsupported")
         rate = self.config.learning_rate if learning_rate is None else learning_rate
         if not math.isfinite(rate) or rate <= 0:
             raise ValueError("Learning rate must be finite and positive")
@@ -365,34 +372,31 @@ class PolicyAgent:
         else:
             for group in self._optimizer.param_groups:
                 group["lr"] = rate
-        targets = torch.tensor(feedback, dtype=torch.float32)
-        # Prior episodes supply the mean/variance of individual action feedback,
-        # never cumulative rewards. Centering this batch on its own mean would
-        # erase all learning from a single evaluated action.
-        baseline = self.reward_mean
+        wealth_growth = feedback[0]
+        # Count each completed episode once, regardless of its action count.
+        # Centering the current episode on itself would erase its gradient.
+        baseline = self.wealth_mean
         scale = 1.0
         if self.config.normalize_advantages:
-            variance = self.reward_m2 / max(1, self.reward_count - 1)
-            scale = max(math.sqrt(max(0.0, variance)), float(targets.std(unbiased=False)),
-                        self.config.advantage_scale_floor)
-        advantages = ((targets - baseline) / scale).detach()
+            variance = self.wealth_m2 / max(1, self.wealth_episode_count - 1)
+            scale = max(math.sqrt(max(0.0, variance)), self.config.advantage_scale_floor)
+        advantage = torch.tensor((wealth_growth - baseline) / scale, dtype=torch.float32)
         log_probabilities = torch.stack([sample.log_probability for sample in samples])
         entropy = torch.stack([sample.entropy for sample in samples]).mean()
-        policy_loss = -(log_probabilities * advantages).mean()
+        policy_loss = -log_probabilities.sum() * advantage
         total = policy_loss - self.config.entropy_weight * entropy
         if not torch.isfinite(total):
-            raise ValueError("Nonfinite evaluator-feedback objective")
+            raise ValueError("Nonfinite terminal wealth objective")
         self._optimizer.zero_grad()
         total.backward()
         nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip, error_if_nonfinite=True)
         self._optimizer.step()
-        for reward in feedback:
-            self.reward_count += 1
-            delta = reward - self.reward_mean
-            self.reward_mean += delta / self.reward_count
-            self.reward_m2 += delta * (reward - self.reward_mean)
+        self.wealth_episode_count += 1
+        delta = wealth_growth - self.wealth_mean
+        self.wealth_mean += delta / self.wealth_episode_count
+        self.wealth_m2 += delta * (wealth_growth - self.wealth_mean)
         return {"policy_loss": float(policy_loss.detach()), "entropy": float(entropy.detach()),
-                "total_loss": float(total.detach()), "mean_feedback": float(targets.mean()),
+                "total_loss": float(total.detach()), "episode_wealth_growth": wealth_growth,
                 "baseline": baseline, "advantage_scale": scale, "samples": float(len(samples))}
 
     def save(self, path: str | Path) -> None:
@@ -400,14 +404,17 @@ class PolicyAgent:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
-            "format_version": 2, "model_kind": "direct_action_policy",
+            "format_version": 3, "model_kind": "direct_wealth_policy",
+            "training_objective": "terminal_net_wealth_growth",
             "state_dict": self.model.state_dict(), "config": asdict(self.config),
             "universe": self.universe, "groups": self.model.groups,
             "initial_funding": self.initial_funding, "train_end": self.train_end,
             "training_last_timestamp": self.training_last_timestamp,
             "validation_end": self.validation_end,
             "validation_last_timestamp": self.validation_last_timestamp,
-            "reward_count": self.reward_count, "reward_mean": self.reward_mean, "reward_m2": self.reward_m2,
+            "risk_config": self.risk_config,
+            "wealth_episode_count": self.wealth_episode_count,
+            "wealth_mean": self.wealth_mean, "wealth_m2": self.wealth_m2,
             "scalers": {symbol: {"mean": torch.from_numpy(scaler.mean),
                                  "scale": torch.from_numpy(scaler.scale),
                                  "counts": torch.from_numpy(scaler.counts),
@@ -418,8 +425,9 @@ class PolicyAgent:
     @classmethod
     def load(cls, path: str | Path) -> "PolicyAgent":
         artifact = torch.load(path, map_location="cpu", weights_only=True)
-        if artifact.get("format_version") != 2 or artifact.get("model_kind") != "direct_action_policy":
-            raise ValueError("Unsupported artifact: a direct-action policy checkpoint is required")
+        if (artifact.get("format_version") != 3 or artifact.get("model_kind") != "direct_wealth_policy"
+                or artifact.get("training_objective") != "terminal_net_wealth_growth"):
+            raise ValueError("Unsupported artifact: a direct-action terminal wealth policy checkpoint is required")
         config = PolicyConfig(**artifact["config"])
         universe = tuple(artifact["universe"])
         scalers = {symbol: FeatureScaler(payload["mean"].numpy(), payload["scale"].numpy(),
@@ -434,5 +442,6 @@ class PolicyAgent:
                    artifact["train_end"], artifact["training_last_timestamp"],
                    validation_end=artifact.get("validation_end"),
                    validation_last_timestamp=artifact.get("validation_last_timestamp"),
-                   reward_count=artifact["reward_count"], reward_mean=artifact["reward_mean"],
-                   reward_m2=artifact["reward_m2"])
+                   risk_config=artifact.get("risk_config"),
+                   wealth_episode_count=artifact["wealth_episode_count"], wealth_mean=artifact["wealth_mean"],
+                   wealth_m2=artifact["wealth_m2"])

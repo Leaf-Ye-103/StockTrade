@@ -20,6 +20,7 @@ def generate_demo(output, *, count=240, frequency_seconds=60, seed=7,
     rng = np.random.default_rng(seed)
     origin = datetime(2025, 1, 6, 14, 30, tzinfo=timezone.utc)
     prices = {symbol: 100.0 + 40 * j for j, symbol in enumerate(symbols)}
+    price_history = {symbol: [] for symbol in symbols}
     bars, events = [], []
     trade_fields = ["timestamp", "trade_id", "symbol", "side", "quantity", "price",
                     "bid", "ask", "spread", "volatility"]
@@ -34,6 +35,9 @@ def generate_demo(output, *, count=240, frequency_seconds=60, seed=7,
                 drift = .0004 * np.sin(index / 25 + number)
                 price = previous * np.exp(common_return + rng.normal(drift, .0013))
                 prices[symbol] = price
+                price_history[symbol].append(float(price))
+                recent_returns = np.diff(np.log(price_history[symbol][-21:]))
+                volatility = float(np.std(recent_returns)) if len(recent_returns) >= 2 else 0.0
                 spread = price * .0002
                 bid, ask = price - spread / 2, price + spread / 2
                 bars.append(dict(timestamp=timestamp.isoformat(), symbol=symbol, open=previous,
@@ -47,7 +51,7 @@ def generate_demo(output, *, count=240, frequency_seconds=60, seed=7,
                             timestamp=(timestamp + timedelta(milliseconds=150 + quantity)).isoformat(),
                             trade_id=f"SYNTHETIC-{index}-{symbol}-{quantity}-{side}", symbol=symbol,
                             side=side, quantity=quantity, price=ask if side == "buy" else bid,
-                            bid=bid, ask=ask, spread=spread, volatility=.0015))
+                            bid=bid, ask=ask, spread=spread, volatility=volatility))
                 if index % 20 == 0:
                     events.extend([
                         dict(published_at=timestamp.isoformat(), available_at=timestamp.isoformat(),

@@ -12,10 +12,9 @@ from stocktrade.demo import generate_demo
 from stocktrade.execution import TradePrint
 from stocktrade.model import PolicyAgent, PolicyConfig, PolicySample
 from stocktrade.pipeline import (
-    _action_advantages, act, evaluate, file_signature, frame_signature, load_market, rollout, train,
+    act, evaluate, file_signature, frame_signature, load_market, rollout, train,
 )
 from stocktrade.policy_contracts import TradingAction
-from stocktrade.rewards import RewardConfig
 from stocktrade.schemas import MarketBar
 
 
@@ -25,7 +24,7 @@ def source_experiment(tmp_path_factory):
     data = generate_demo(root / "data", count=100, symbols=("NVDA", "MSFT"))
     model = root / "model"
     train(data / "bars.csv", data / "events.jsonl", data / "trades.csv", model,
-          epochs=1, lookback=4, reward_horizon=3, symbols=("NVDA", "MSFT"))
+          epochs=1, lookback=4, symbols=("NVDA", "MSFT"))
     return root
 
 
@@ -49,7 +48,7 @@ def test_policy_encoders_learn_from_actual_matured_feedback(experiment):
     data, model, _ = paths(experiment)
     history = json.loads((model / "training.json").read_text())
     metadata = history["metadata"]
-    assert metadata["training_supported_feedback"] > 0
+    assert metadata["training_matched_orders"] > 0
     updates = history["history"][0]["updates"]
     assert updates and all("policy_loss" in row and "value_loss" not in row for row in updates)
     _, frames = load_market(data / "bars.csv", data / "events.jsonl", ("NVDA", "MSFT"),
@@ -67,40 +66,30 @@ def test_evaluate_reports_actions_feedback_and_never_updates_weights(experiment)
     _, model, output = paths(experiment)
     before = file_signature(model / "model.pt")
     report = run_evaluation(experiment)
-    assert report["decisions"] == 12
+    assert report["decisions"] == 14
     assert report["source_is_synthetic"] and not report["policy_updated"]
     assert "heldout_return_mae" not in report
     assert report["universe"] == ["NVDA", "MSFT"]
     assert file_signature(model / "model.pt") == before
     records = [json.loads(row) for row in (output / "decisions.jsonl").read_text().splitlines()]
-    assert len(records) == 12
+    assert len(records) == 14
     assert all("policy_action" in record and "forecast" not in record for record in records)
 
 
-def test_all_training_feedback_matures_within_training_partition(experiment):
-    data, model, _ = paths(experiment)
+def test_complete_training_episodes_stay_in_training_partition(experiment):
+    _, model, _ = paths(experiment)
     metadata = json.loads((model / "model.info.json").read_text())
-    _, frames = load_market(data / "bars.csv", data / "events.jsonl", ("NVDA", "MSFT"),
-                           schemas=metadata["feature_schemas"])
     cutoff = datetime.fromisoformat(metadata["train_end_time"])
-    records = [json.loads(row) for row in (model / "training_feedback.jsonl").read_text().splitlines()]
-    for record in records:
-        feedback = record["feedback"]
-        if feedback["status"] == "supported":
-            maturity = datetime.fromisoformat(feedback["maturity_timestamp"])
-            assert maturity <= cutoff
-            assert maturity == frames["NVDA"].timestamps[record["bar_index"] + 3]
-        elif feedback["status"] == "unmatched":
-            assert feedback["reward"] is None
-
-
-def test_good_sale_never_rewards_bad_entry_and_missing_feedback_stays_missing():
-    records = [dict(bar_index=0, feedback={"reward": -.05}),
-               dict(bar_index=2, feedback={"reward": None}),
-               dict(bar_index=5, feedback={"reward": .85})]
-    feedback = _action_advantages(records)
-    assert feedback == {0: -.05, 2: .85}
-    assert 1 not in feedback
+    records = [json.loads(row) for row in (model / "training_decisions.jsonl").read_text().splitlines()]
+    assert records and all(datetime.fromisoformat(row["timestamp"]) < cutoff for row in records)
+    assert all("feedback" not in row for row in records)
+    history = json.loads((model / "training.json").read_text())["history"]
+    for epoch in history:
+        for episode in epoch["episodes"]:
+            assert episode["objective"]["wealth_growth"] == pytest.approx(
+                episode["objective"]["final_equity"] / episode["objective"]["initial_funding"] - 1)
+        for update in epoch["updates"]:
+            assert "episode_wealth_growth" in update and "mean_feedback" not in update
 
 
 def test_act_outputs_dollar_trade_for_permitted_symbol(experiment, monkeypatch):
@@ -112,7 +101,7 @@ def test_act_outputs_dollar_trade_for_permitted_symbol(experiment, monkeypatch):
 
     monkeypatch.setattr(PolicyAgent, "act", fixed_action)
     proposal = act(data / "bars.csv", data / "events.jsonl", model / "model.pt",
-                   funding=10000, symbols=("NVDA",))
+                   funding=10000, symbols=("NVDA",), collect=False)
     assert proposal["total_funding"] == 10000 and proposal["allowed_symbols"] == ["NVDA"]
     assert proposal["policy_action"]["value"] == 100
     assert len(proposal["trading_actions"]) == 1
@@ -123,24 +112,106 @@ def test_act_outputs_dollar_trade_for_permitted_symbol(experiment, monkeypatch):
 
 def test_runtime_subset_is_respected_and_unknown_symbols_rejected(experiment):
     data, model, _ = paths(experiment)
-    proposal = act(data / "bars.csv", data / "events.jsonl", model / "model.pt", symbols=("MSFT",))
+    proposal = act(data / "bars.csv", data / "events.jsonl", model / "model.pt", symbols=("MSFT",), collect=False)
     assert all(action["symbol"] == "MSFT" for action in proposal["trading_actions"])
     with pytest.raises(ValueError, match="subset"):
-        act(data / "bars.csv", data / "events.jsonl", model / "model.pt", symbols=("UNKNOWN",))
+        act(data / "bars.csv", data / "events.jsonl", model / "model.pt", symbols=("UNKNOWN",), collect=False)
 
 
 def test_existing_holdings_require_separate_cash(experiment):
     data, model, _ = paths(experiment)
     with pytest.raises(ValueError, match="cash"):
-        act(data / "bars.csv", data / "events.jsonl", model / "model.pt", holdings={"NVDA": 1})
+        act(data / "bars.csv", data / "events.jsonl", model / "model.pt", holdings={"NVDA": 1}, collect=False)
     proposal = act(data / "bars.csv", data / "events.jsonl", model / "model.pt",
-                   holdings={"NVDA": 1}, cash=90000)
+                   holdings={"NVDA": 1}, cash=90000, collect=False)
     assert proposal["available_cash"] == 90000 and proposal["equity"] > 90000
     assert act(data / "bars.csv", data / "events.jsonl", model / "model.pt",
-               holdings={"NVDA": 0})["available_cash"] == 100000
+               holdings={"NVDA": 0}, collect=False)["available_cash"] == 100000
 
 
-def test_actual_loss_cutting_sale_never_turns_the_bad_purchase_reward_positive(monkeypatch):
+def test_account_loss_history_is_required_before_existing_account_buys(experiment, monkeypatch):
+    data, model, _ = paths(experiment)
+    monkeypatch.setattr(PolicyAgent, "act", lambda *a, **k: PolicySample(
+        TradingAction(1, "NVDA", "buy", 1000, .01), torch.tensor(-.5), torch.tensor(0.)))
+    unknown = act(data / "bars.csv", data / "events.jsonl", model / "model.pt",
+                  cash=70000, holdings={"NVDA": 10}, collect=False)
+    assert unknown["risk_history_status"] == "missing"
+    assert unknown["risk_decision"]["reasons"] == ("risk_history_missing",)
+    assert unknown["trading_actions"] == []
+    known = act(data / "bars.csv", data / "events.jsonl", model / "model.pt",
+                cash=70000, holdings={"NVDA": 10}, peak_equity=100000, day_start_equity=100000,
+                collect=False)
+    assert known["risk_history_status"] == "provided"
+    assert {"drawdown_limit", "daily_loss_limit"} <= set(known["risk_decision"]["reasons"])
+    assert known["trading_actions"] == []
+
+
+def test_stale_online_market_data_is_rejected_before_any_web_request(experiment, monkeypatch):
+    import stocktrade.collection as collection
+    data, model, _ = paths(experiment)
+    monkeypatch.setattr(collection, "collect_information", lambda *a, **k: pytest.fail("Stale market triggered HTTP"))
+    with pytest.raises(ValueError, match="stale"):
+        act(data / "bars.csv", data / "events.jsonl", model / "model.pt")
+
+
+def test_online_collection_uses_current_feature_clock_without_retiming_bars(experiment, monkeypatch):
+    import stocktrade.pipeline as pipeline
+    import stocktrade.collection as collection
+    data, model, _ = paths(experiment)
+    metadata = json.loads((model / "model.info.json").read_text())
+    raw_bars, initial = load_market(data / "bars.csv", data / "events.jsonl", ("NVDA", "MSFT"),
+                                     schemas=metadata["feature_schemas"])
+    market_time = raw_bars["NVDA"][-1].timestamp
+    now = market_time + timedelta(seconds=30)
+    before_hash = file_signature(data / "bars.csv")
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    monkeypatch.setattr(pipeline, "datetime", Clock)
+    captured = {}
+
+    def gather(symbols, output, config_path=None):
+        assert set(symbols) == {"NVDA", "MSFT"}
+        events = [dict(published_at=(now - timedelta(seconds=20)).isoformat(),
+                       available_at=(now - timedelta(seconds=10)).isoformat(),
+                       expires_at=(now + timedelta(hours=1)).isoformat(),
+                       source="fixture://collected", symbol="NVDA", kind="news", values={}, text="New report"),
+                  dict(published_at=(now + timedelta(hours=1)).isoformat(), available_at=now.isoformat(),
+                       source="fixture://future", symbol="NVDA", kind="news", values={}, text="Future story")]
+        from pathlib import Path
+        Path(output).write_text("".join(json.dumps(row) + "\n" for row in events))
+        return collection.CollectionReport(events_added=2)
+
+    def inspect(_agent, frames, index, state, **kwargs):
+        captured.update(frames)
+        return PolicySample(TradingAction(0, None, "hold", 0.), torch.tensor(-.5), torch.tensor(0.))
+
+    monkeypatch.setattr(collection, "collect_information", gather)
+    monkeypatch.setattr(PolicyAgent, "act", inspect)
+    proposal = act(data / "bars.csv", data / "events.jsonl", model / "model.pt",
+                   collection_output=experiment / "online.jsonl")
+    assert proposal["timestamp"] == now and proposal["market_timestamp"] == market_time
+    assert captured["NVDA"].timestamps[-1] == now
+    assert captured["NVDA"].prices[-1] == initial["NVDA"].prices[-1]
+    assert file_signature(data / "bars.csv") == before_hash
+    _, baseline = load_market(data / "bars.csv", data / "events.jsonl", ("NVDA", "MSFT"),
+                               schemas=metadata["feature_schemas"], as_of=now)
+    column = captured["NVDA"].feature_names.index("news.decayed_count")
+    # Exactly the eligible story contributes, while the future publication is excluded.
+    assert captured["NVDA"].values[-1, column] - baseline["NVDA"].values[-1, column] == pytest.approx(
+        np.exp(-10 / (6 * 3600)), abs=1e-6)
+
+
+def test_historical_evaluation_never_collects_current_web(experiment, monkeypatch):
+    import stocktrade.collection as collection
+    monkeypatch.setattr(collection, "collect_information", lambda *a, **k: pytest.fail("Historical HTTP lookup"))
+    assert run_evaluation(experiment)["objective_name"] == "terminal_net_wealth_growth"
+
+
+def test_buy_and_protective_sale_share_only_the_final_portfolio_wealth(monkeypatch):
     origin = datetime(2025, 1, 1, tzinfo=timezone.utc)
     prices = [100, 100, 100, 95] + [10] * 10
     bars = [MarketBar(origin + timedelta(minutes=i), "NVDA", price, price, price, price,
@@ -163,18 +234,16 @@ def test_actual_loss_cutting_sale_never_turns_the_bad_purchase_reward_positive(m
             f"SYNTHETIC-{side}", "NVDA", side, 1, prices[index],
             bid=prices[index], ask=prices[index], spread=0., volatility=volatility))
     report, _, feedback = rollout(agent, {"NVDA": bars}, {"NVDA": frame}, prints,
-        start=2, stop=len(bars), funding=1000, reward_config=RewardConfig(horizon_steps=8, fee_bps=1.))
-    buy, sell = report["feedback_records"][:2]
-    assert report["supported_trade_feedback"] == 2
-    assert buy["feedback"]["reward"] < 0 < sell["feedback"]["reward"]
-    assert feedback[0] == buy["feedback"]["reward"]
-    assert feedback[1] == sell["feedback"]["reward"]
+        start=2, stop=len(bars), funding=1000, training=True)
+    buy, sell = report["decision_records"][:2]
+    assert report["matched_orders"] == 2
+    assert "feedback" not in buy and "feedback" not in sell
     assert buy["account_before"]["holdings"] == {}
     assert sell["account_before"]["holdings"] == {"NVDA": 1}
-    assert buy["feedback"]["components"]["terminal_actual_vs_hold_advantage"] == pytest.approx(-5.0195)
-    assert sell["feedback"]["components"]["terminal_actual_vs_hold_advantage"] == pytest.approx(84.9905)
-    assert buy["feedback"]["source_trade_ids"] == ("SYNTHETIC-buy", "SYNTHETIC-sell")
     assert report["final_equity"] == pytest.approx(994.9805)
+    assert report["objective"]["wealth_growth"] == pytest.approx(-.0050195)
+    assert feedback and all(value == report["objective"]["wealth_growth"] for value in feedback)
+    assert report["learning_eligible"] and not report["action_grading"]
 
 
 def test_rejects_checkpoint_sidecar_mismatch(experiment):
@@ -223,7 +292,7 @@ def test_future_only_event_does_not_enter_schema_or_change_learning(experiment):
             source="future", kind="fundamentals", symbol="NVDA", values={"unknown_key": 1e12})) + "\n")
     alternative = model.with_name("alternative")
     metadata = train(data / "bars.csv", data / "events.jsonl", data / "trades.csv", alternative,
-        epochs=1, lookback=4, reward_horizon=3, symbols=("NVDA", "MSFT"))
+        epochs=1, lookback=4, symbols=("NVDA", "MSFT"))
     modified = PolicyAgent.load(alternative / "model.pt")
     assert "fundamentals.unknown_key" not in metadata["feature_schemas"]["NVDA"]
     assert all(torch.equal(value, modified.model.state_dict()[name])
@@ -252,7 +321,7 @@ def test_backdated_policy_actions_are_rejected(experiment):
         writer.writeheader()
         writer.writerows(rows)
     with pytest.raises(ValueError, match="cutoff"):
-        act(path, data / "events.jsonl", model / "model.pt")
+        act(path, data / "events.jsonl", model / "model.pt", collect=False)
 
 
 def test_insufficient_reward_partition_fails_before_training(experiment):

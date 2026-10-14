@@ -35,6 +35,8 @@ class InformationEvent:
     values: dict[str, float | None] = field(default_factory=dict)
     text: str = ""
     symbol: str | None = None
+    # The exclusive validity boundary; expiry never changes when replayed.
+    expires_at: datetime | None = None
 
 
 @dataclass(frozen=True)

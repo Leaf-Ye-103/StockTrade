@@ -1,6 +1,7 @@
 """Command-line action-policy research workflows; no live order submission exists."""
 
 import argparse
+from dataclasses import fields
 import json
 import sys
 from pathlib import Path
@@ -17,6 +18,21 @@ def _holdings(path):
            for symbol, quantity in value.items()):
         raise ValueError("Holdings require nonempty stock symbols and nonnegative whole-share quantities")
     return value
+
+
+def _risk_config(path):
+    if path is None:
+        return None
+    from .risk import RiskConfig
+    value = json.loads(Path(path).read_text())
+    if not isinstance(value, dict):
+        raise ValueError("Risk configuration must be a JSON object containing RiskConfig field overrides")
+    unknown = set(value) - {field.name for field in fields(RiskConfig)}
+    if unknown:
+        raise ValueError(f"Unknown risk configuration fields: {', '.join(sorted(unknown))}")
+    if any(isinstance(number, bool) or not isinstance(number, (int, float)) for number in value.values()):
+        raise ValueError("Risk configuration values must be numeric; lot_size must be a positive integer")
+    return RiskConfig(**value)
 
 
 def _console_report(result, args):
@@ -44,8 +60,9 @@ def main(argv=None):
     demo.add_argument("--frequency-seconds", type=int, default=60)
     demo.add_argument("--funding", type=float, default=100000.0)
     demo.add_argument("--symbols", nargs="+", default=["NVDA", "MSFT", "AAPL"])
-    demo.add_argument("--reward-horizon", type=int, default=8)
-    training = sub.add_parser("train", help="Train an action policy from chronological observed-trade feedback")
+    demo.add_argument("--episode-steps", type=int, default=128)
+    demo.add_argument("--risk-config", help="JSON file containing hard risk-limit overrides")
+    training = sub.add_parser("train", help="Train a policy to maximize episode terminal portfolio wealth")
     training.add_argument("--bars", required=True)
     training.add_argument("--events")
     training.add_argument("--trades", required=True,
@@ -56,10 +73,7 @@ def main(argv=None):
     training.add_argument("--lookback", type=int, default=16)
     training.add_argument("--funding", type=float, default=100000.0)
     training.add_argument("--symbols", nargs="+", help="Allowed stock symbols; defaults to all input stocks")
-    training.add_argument("--reward-horizon", type=int, default=8)
-    training.add_argument("--selection-drawdown-weight", type=float, default=.5,
-                          help="Validation checkpoint score penalizes portfolio drawdown by this weight")
-    training.add_argument("--constraint-penalty", type=float, default=.001)
+    training.add_argument("--risk-config", help="JSON file containing hard risk-limit overrides")
     training.add_argument("--episode-steps", type=int, default=128)
     training.add_argument("--train-fraction", type=float, default=.7)
     training.add_argument("--validation-fraction", type=float, default=.15)
@@ -81,7 +95,29 @@ def main(argv=None):
     action.add_argument("--symbols", nargs="+", help="Restrict trading to a subset of checkpoint stocks")
     action.add_argument("--holdings", help="JSON file mapping allowed stock symbols to whole-share quantities")
     action.add_argument("--cash", type=float, help="Current uninvested cash; required when shares are held")
+    action.add_argument("--peak-equity", type=float, help="Actual historical peak equity for drawdown controls")
+    action.add_argument("--day-start-equity", type=float, help="Actual equity at today's start for daily-loss controls")
+    action.add_argument("--offline", action="store_true", help="Use supplied events without online collection")
+    action.add_argument("--sources", help="Online information source configuration JSON file")
+    action.add_argument("--collection-output", default="data/online-events.jsonl",
+                        help="Append online observations with their actual availability timestamps")
+    action.add_argument("--max-market-age-seconds", type=float, default=900.0,
+                        help="Maximum market-data age for online action proposals")
     action.add_argument("--output", help="Optional JSON file for proposed actions; no order is submitted")
+    collection = sub.add_parser("collect-information", help="Gather configured online information for stocks")
+    collection.add_argument("--symbols", nargs="+", required=True)
+    collection.add_argument("--output", required=True)
+    collection.add_argument("--sources", help="Online information source configuration JSON file")
+    alpaca_bars = sub.add_parser("fetch-alpaca-bars", help="Import read-only Alpaca minute bars with provenance")
+    alpaca_news = sub.add_parser("fetch-alpaca-news", help="Import read-only Alpaca news at actual retrieval time")
+    for importer in (alpaca_bars, alpaca_news):
+        importer.add_argument("--symbols", nargs="+", required=True)
+        importer.add_argument("--start", required=True, help="ISO 8601 timestamp including a UTC offset")
+        importer.add_argument("--end", required=True, help="ISO 8601 timestamp including a UTC offset")
+        importer.add_argument("--timeout", type=float, default=15.0)
+    alpaca_bars.add_argument("--output", required=True, help="New directory for bars.csv and provenance.json")
+    alpaca_bars.add_argument("--feed", choices=("iex", "sip"), default="iex")
+    alpaca_news.add_argument("--output", required=True, help="New JSONL file for archived news events")
     news = sub.add_parser("collect-news", help="Fetch a permitted HTTPS RSS/Atom feed; record observation time")
     news.add_argument("--url", required=True)
     news.add_argument("--output", required=True)
@@ -91,6 +127,16 @@ def main(argv=None):
         if args.command == "collect-news":
             from .data import collect_rss
             result = dict(collected_events=collect_rss(args.url, args.output, symbol=args.symbol))
+        elif args.command == "collect-information":
+            from .collection import collect_information
+            result = collect_information(tuple(args.symbols), args.output, config_path=args.sources).to_dict()
+        elif args.command == "fetch-alpaca-bars":
+            from .platforms import fetch_alpaca_bars
+            result = fetch_alpaca_bars(tuple(args.symbols), args.start, args.end, args.output,
+                                      feed=args.feed, timeout=args.timeout)
+        elif args.command == "fetch-alpaca-news":
+            from .platforms import fetch_alpaca_news
+            result = fetch_alpaca_news(tuple(args.symbols), args.start, args.end, args.output, timeout=args.timeout)
         else:
             from .pipeline import act, evaluate, train, write_json
             symbols = tuple(args.symbols) if args.symbols else None
@@ -101,7 +147,8 @@ def main(argv=None):
                                      seed=args.seed, symbols=symbols)
                 train(data / "bars.csv", data / "events.jsonl", data / "trades.csv", output / "model",
                       epochs=args.epochs, seed=args.seed, funding=args.funding, symbols=symbols,
-                      reward_horizon=args.reward_horizon)
+                      episode_steps=args.episode_steps,
+                      risk_config=_risk_config(args.risk_config))
                 result = evaluate(data / "bars.csv", data / "events.jsonl", data / "trades.csv",
                                   output / "model/model.pt", output / "evaluation",
                                   funding=args.funding, symbols=symbols)
@@ -109,9 +156,8 @@ def main(argv=None):
             elif args.command == "train":
                 result = train(args.bars, args.events, args.trades, args.output, epochs=args.epochs,
                                seed=args.seed, lookback=args.lookback, funding=args.funding,
-                               symbols=symbols, reward_horizon=args.reward_horizon,
-                               selection_drawdown_weight=args.selection_drawdown_weight,
-                               constraint_penalty=args.constraint_penalty, episode_steps=args.episode_steps,
+                               symbols=symbols,
+                               risk_config=_risk_config(args.risk_config), episode_steps=args.episode_steps,
                                train_fraction=args.train_fraction, validation_fraction=args.validation_fraction)
             elif args.command == "evaluate":
                 result = evaluate(args.bars, args.events, args.trades, args.checkpoint, args.output,
@@ -121,7 +167,11 @@ def main(argv=None):
                 if holdings and any(holdings.values()) and args.cash is None:
                     raise ValueError("--cash is required when --holdings contains invested shares")
                 result = act(args.bars, args.events, args.checkpoint, funding=args.funding,
-                             symbols=symbols, cash=args.cash, holdings=holdings)
+                             symbols=symbols, cash=args.cash, holdings=holdings,
+                             peak_equity=args.peak_equity, day_start_equity=args.day_start_equity,
+                             collect=not args.offline,
+                             sources_path=args.sources, collection_output=args.collection_output,
+                             max_market_age_seconds=args.max_market_age_seconds)
                 if args.output:
                     write_json(args.output, result)
         print(json.dumps(_console_report(result, args), indent=2, default=str, allow_nan=False))

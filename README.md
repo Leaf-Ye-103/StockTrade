@@ -1,8 +1,8 @@
 # StockTrade
 
-A modular research system that takes total funding, a permitted stock universe, current holdings and point-in-time information, then proposes **buy, sell or hold actions with dollar amounts**. A separate historical evaluator supplies reinforcement feedback from recorded executions and later observed prices. The trading model emits actions directly: it has no price-forecast output or prediction-loss objective.
+StockTrade takes total funding, a permitted stock universe, current holdings and point-in-time information, then proposes **buy, sell or hold actions with dollar amounts**. Its trainable neural policy has one financial goal: grow final net account value over a complete trading episode, subject to hard risk constraints. It does not predict a stock price or assign hand-written rewards to individual trades.
 
-The workflow supports multiple US equities in USD, with minute or second bars. Inputs can include OHLCV, quotes, measured order-flow and depth metrics, macroeconomic releases, company fundamentals and news. All inputs must have been available at the decision time. No broker orders are submitted.
+Inputs include OHLCV, quotes, observed order-flow/depth metrics, macroeconomic releases, fundamentals, news and investment-platform metrics. Minute and second bars are supported for multiple US equities in USD. Online action inference refreshes registered public information sources automatically; historical training/evaluation use supplied point-in-time archives. No broker orders are submitted.
 
 ## Install and run
 
@@ -16,59 +16,80 @@ pytest
 ruff check src tests
 ```
 
-The demo generates synthetic records and runs training and evaluation offline. It checks the software workflow; its results are not investment performance evidence. Add `--frequency-seconds 1` to exercise second bars.
+The demo generates synthetic observations and executions. It validates the workflow, not investment performance. Add `--frequency-seconds 1` to exercise second bars.
 
-Train using your normalized observations and recorded executions:
+Train and evaluate using your normalized archives:
 
 ```bash
-stocktrade train --bars data/bars.csv --events data/events.jsonl --trades data/trades.csv --funding 100000 --symbols NVDA MSFT --reward-horizon 8 --output runs/model --epochs 3
+stocktrade train --bars data/bars.csv --events data/events.jsonl --trades data/trades.csv --funding 100000 --symbols NVDA MSFT --episode-steps 128 --output runs/model --epochs 3
 stocktrade evaluate --bars data/bars.csv --events data/events.jsonl --trades data/trades.csv --checkpoint runs/model/model.pt --funding 100000 --symbols NVDA MSFT --output runs/evaluation
 ```
 
-Request a current action without training or evaluating against future data:
+Request a current action using recent completed bars. Online information collection is enabled by default:
 
 ```bash
-stocktrade act --bars data/bars.csv --events data/events.jsonl --checkpoint runs/model/model.pt --funding 100000 --symbols NVDA MSFT --holdings data/holdings.json --cash 80000 --output runs/action.json
+stocktrade act --bars data/current-bars.csv --events data/events.jsonl --checkpoint runs/model/model.pt --funding 100000 --symbols NVDA MSFT --holdings data/holdings.json --cash 80000 --peak-equity 100000 --day-start-equity 100000 --output runs/action.json
 ```
 
-The holdings file maps stock symbols to nonnegative whole-share quantities, for example `{"NVDA": 100, "MSFT": 20}`. Supply actual remaining cash when supplying holdings. Without holdings, the initial account starts with the funding in cash.
+Use `--offline` when replaying historical observations or deliberately using supplied events only. Action observations must be after the checkpoint's training/validation cutoff in either mode. Online mode rejects future-dated market bars and bars older than 900 seconds by default; `--max-market-age-seconds` configures that freshness limit. Current collection time can advance the final information clock without inventing a new OHLCV bar.
 
-The policy chooses one action per decision: hold, or buy/sell one allowed stock using a budget of 1%, 5%, 10% or 20% of initial funding. These bins are configurable through the Python API. The risk layer may reduce or reject the proposal. Execution uses whole shares: a $100 budget cannot buy one $225 share, and no fractional execution is invented.
+The holdings file maps trained stock symbols to nonnegative whole-share quantities, for example `{"NVDA": 100, "MSFT": 20}`. Supply actual remaining cash and historical `--peak-equity`/`--day-start-equity` for an existing account; the example values are illustrative and must be replaced with actual account history. Missing either baseline blocks new buys with `risk_history_missing`, while still permitting a chosen hold or risk-checked sale. Only a modeled fresh account with no explicit cash and no owned shares infers both baselines from initial funding. The runtime permitted symbols can be a subset of the trained universe; adding a stock requires retraining.
 
-Training uses chronological 70% training, 15% validation and 15% held-out partitions by default. Training chunks default to 128 bars with a fresh funded account per chunk. Each chunk/partition reserves its final reward-horizon bars for observing feedback rather than opening new actions. Validation selects checkpoints by its recorded-execution account return minus 0.5 times maximum drawdown; `--selection-drawdown-weight` configures that penalty. Validation does not update weights, and held-out evaluation never trains them. Preprocessing learns only from the training prefix.
+The policy chooses hold, or one allowed stock and a buy/sell budget of 1%, 5%, 10% or 20% of initial funding. The bins are configurable through the Python API. Risk sizing can reduce or reject an action and rounds down to whole shares: $100 cannot buy one $225 share.
 
-Keep `model.info.json` beside `model.pt`. Training writes `training.json` and `training_feedback.jsonl`; evaluation writes `report.json` and `decisions.jsonl`, including source trade IDs and reward components. Earlier forecast-based checkpoints are incompatible and must be retrained as direct-action policies.
+## Financial objective and execution evidence
 
-## What the feedback means
+For a complete episode, the learning signal is:
 
-For each decision, the evaluator compares the subsequent **matched-execution account path** with a baseline that freezes the cash and all shares held immediately before that decision. Both paths use later observed stock prices. A purchase therefore competes with retaining its cash, and a sale with retaining the same existing shares. The account path includes subsequent supported trades and their fees; the baseline needs no alternative trade.
+```text
+wealth_growth = final_account_equity / initial_funding - 1
+```
 
-For example, buying one share at $100, actually matching a sale at $95 and observing it later at $10 can reward selling for avoiding the additional $85 decline. The purchase is evaluated using the account's $5 loss after that supported sale, rather than pretending it stayed invested until $10. Each decision has its own baseline: the sale's reward is never added to the purchase's feedback. A rebound above $95 can instead penalize the sale for the foregone recovery. Holds can receive feedback from subsequent supported portfolio choices; if the account continues unchanged, holding has zero feedback.
+Final equity includes remaining cash and observed marks for existing positions, after recorded execution prices and configured fees. There is no assumed final liquidation. Every sampled decision in an admissible trajectory receives the same episode signal through REINFORCE; there are no per-trade grades, imagined alternatives, risk penalties in the financial objective or price-prediction losses.
 
-Default feedback compares the two equity paths at future bars 1, 4 and 8, weighted 25%, 25% and 50%, and adjusts for their difference in downside. Execution fees are already included in the account path and are not deducted again. Changing `--reward-horizon` scales these checkpoints. Feedback is normalized by initial funding. The horizon defines what “later” means; the evaluator does not choose the best endpoint after seeing the outcome. Overlapping feedback sums are diagnostic only: they are neither portfolio profit nor the checkpoint-selection objective.
+Buying at $100 and selling at $95 leaves $95 before fees. If the stock subsequently falls to $10, that trajectory preserves much more wealth than holding it, even though the round trip lost $5. The model learns from whole-account outcomes across episodes rather than awarding a separate avoided-loss bonus to the sale.
 
-Historical evaluation requires compatible **recorded trades**, including direction, exact quantity, timing and quote/regime evidence. Unsupported actions remain unmatched and receive no economic reward. Matching is an observational estimate; it cannot establish the queue priority or causal market impact of adding your order.
+Hard controls constrain concentration, gross exposure, cash, liquidity, turnover and losses. An episode that breaches observed risk limits or lacks execution evidence for its intended trades is reported and excluded from training and checkpoint selection. Risk breaches do not become invented financial penalties. Default limits are research settings and cannot guarantee safety through gaps or unavailable liquidity.
+
+Execution evaluation requires compatible **recorded trades**, including direction, exact quantity, timing and quote/regime evidence. Unsupported intentions remain unmatched; no bar-price fill is invented. Historical analogs cannot establish the causal market impact or altered queue priority of inserting your order.
+
+Training uses chronological 70% training, 15% validation and 15% held-out partitions by default, with bounded training episodes starting from fresh funding. Training chunks have the same configured bar count (128 by default, reduced if the training prefix is shorter); an incomplete final chunk is left unused. The final bar values the account; it opens no new order. Preprocessing learns only from the training prefix. Validation selects the highest terminal wealth among admissible checkpoints over the same period; held-out evaluation never updates weights.
+
+Keep `model.info.json` beside `model.pt`. Training writes `training.json` and `training_decisions.jsonl`; evaluation writes `report.json` and `decisions.jsonl`. Forecast and earlier action-reward checkpoints must be retrained in the new `direct_wealth_policy` format.
+
+## Information collection and platforms
+
+```bash
+stocktrade collect-information --symbols NVDA MSFT --output data/online-events.jsonl
+stocktrade collect-information --symbols NVDA MSFT --sources data/sources.json --output data/online-events.jsonl
+```
+
+Defaults attempt ticker-specific Yahoo Finance RSS and global Federal Reserve monetary-policy news. Configured HTTPS RSS, HTML and JSON sources can extend coverage. Collection is bounded and reports unavailable sources; it does not browse the entire internet. Dated source publication, actual receipt, expiry, deduplication and provenance are preserved. Undated RSS items are skipped; HTML/JSON sources lacking publication metadata fail visibly. Expiry is measured from source publication, so fetching unchanged old content cannot renew its freshness or historical availability.
+
+Investment-platform metrics enter an ordinary neural feature group. Their importance is learned with other information, without a fixed priority multiplier. Provider archives, missingness and timestamps still determine whether those metrics can be used.
+
+Read-only Alpaca imports provide a starter path for minute bars and news:
+
+```bash
+stocktrade fetch-alpaca-bars --symbols NVDA MSFT --start 2025-01-02T14:30:00Z --end 2025-01-02T16:00:00Z --feed iex --output data/alpaca-sample
+stocktrade fetch-alpaca-news --symbols NVDA MSFT --start 2025-01-02T14:30:00Z --end 2025-01-02T16:00:00Z --output data/alpaca-news.jsonl
+```
+
+The adapter needs `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` in secure environment settings and the applicable data entitlement. Bars/news do not provide the separate trade/quote evidence needed for execution evaluation. A historical news download receives current retrieval availability, so it cannot be inserted into past decisions. No account signup, purchased plan or forward paper-order integration is implied.
+
+See [architecture](docs/architecture.md), [data formats and collection configuration](docs/data.md), [research methodology](docs/research.md) and [platform options](docs/platforms.md). LEAN requires a custom observed-execution fill model; venue-specific MBO and NautilusTrader are later queue-research options. Current provider pricing and entitlements need verification.
 
 ## Research blocks
 
 | Block | Purpose |
 | --- | --- |
-| [Data ingestion and features](src/stocktrade/data.py) | Align observed market and information inputs at each decision and preserve missingness. |
-| [Action contracts](src/stocktrade/policy_contracts.py) | Represent funding, cash, holdings and dollar-valued buy/sell/hold proposals. |
-| [Direct policy](src/stocktrade/model.py) | Encode stock histories and account state, compare stocks and learn action probabilities from evaluator feedback. |
-| [Action risk](src/stocktrade/action_risk.py) | Constrain exposure, cash, liquidity and whole-share size before execution evaluation. |
-| [Execution evidence](src/stocktrade/execution.py) | Match proposals to observed executions and report unsupported orders. |
-| [Action evaluator](src/stocktrade/rewards.py) | Compare supported portfolio continuation with frozen pre-decision cash/holdings at fixed future horizons. |
-| [Workflow](src/stocktrade/pipeline.py) | Preserve chronological partitions, mature feedback and checkpoint/report provenance. |
+| [Data](src/stocktrade/data.py) | Point-in-time feature alignment, missingness and expiry. |
+| [Collection](src/stocktrade/collection.py) | Bounded automatic public-source refresh and provenance. |
+| [Platforms](src/stocktrade/platforms.py) | Read-only provider imports without broker order endpoints. |
+| [Policy](src/stocktrade/model.py) | Trainable modality/temporal/account encoders, cross-stock attention and direct actions. |
+| [Risk](src/stocktrade/action_risk.py) | Hard account and liquidity constraints before execution. |
+| [Execution](src/stocktrade/execution.py) | Observed matches and conditional account ledger. |
+| [Objective](src/stocktrade/objective.py) | Terminal net wealth and separate episode feasibility. |
+| [Workflow](src/stocktrade/pipeline.py) | Chronological episodes, training and checkpoint/report provenance. |
 
-See [architecture](docs/architecture.md), [input formats](docs/data.md) and [research methodology](docs/research.md).
-
-Collect permitted public RSS or Atom news for later ingestion:
-
-```bash
-stocktrade collect-news --url https://example.com/news/rss --output data/news.jsonl --symbol NVDA
-```
-
-Replace the example with a feed you are allowed to fetch. A fresh scrape records actual collection time and cannot supply historical availability retroactively.
-
-Real queue reconstruction requires exchange-level order lifecycle data and a provider adapter. There is no integrated commercial feed, production trading system or demonstrated financial edge. Historical coverage bias, unmodeled risks and the choice of feedback horizons need further research before any market-performance claim.
+No financial edge has been demonstrated. Realistic performance claims require licensed historical observations, adequate execution coverage and independent evaluation across market regimes.
