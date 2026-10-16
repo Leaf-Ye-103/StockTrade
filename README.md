@@ -6,6 +6,9 @@ Inputs include OHLCV, quotes, observed order-flow/depth metrics, macroeconomic r
 
 ## Install and run
 
+For Windows/macOS/Linux laptop installation, credentials and larger experiments,
+see [running on your laptop](docs/laptop.md).
+
 The package supports Python 3.11 or newer. The pinned CPU development environment was validated on Python 3.12 and Linux x86_64. From the existing checkout:
 
 ```bash
