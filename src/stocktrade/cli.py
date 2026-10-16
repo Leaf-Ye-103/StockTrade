@@ -42,7 +42,10 @@ def _console_report(result, args):
             key: value for key, value in result["execution"].items()
             if key not in {"records", "equity_curve", "source_trade_ids"}
         }
-    if args.command in {"evaluate", "demo"}:
+    if "diagnostics" in console:
+        console["diagnostics"] = {key: result["diagnostics"][key]
+                                  for key in ("evaluation_only", "used_for_training", "decisions")}
+    if args.command in {"evaluate", "demo", "report"}:
         directory = Path(args.output) / "evaluation" if args.command == "demo" else Path(args.output)
         console["report_path"] = str(directory / "report.json")
     elif args.command == "act" and args.output:
@@ -86,6 +89,18 @@ def main(argv=None):
     evaluation.add_argument("--funding", "--cash", dest="funding", type=float,
                             help="Starting funding; defaults to the checkpoint's configured funding")
     evaluation.add_argument("--symbols", nargs="+", help="Restrict trading to a subset of checkpoint stocks")
+    reporting = sub.add_parser("report", help="Visualize archived decisions without running or training a policy")
+    reporting.add_argument("--bars", required=True)
+    reporting.add_argument("--report", required=True, help="Archived evaluation report.json")
+    reporting.add_argument("--decisions", required=True, help="Archived decisions.jsonl")
+    reporting.add_argument("--output", required=True, help="New output directory preserving the source audit")
+    for reporter in (demo, evaluation, reporting):
+        reporter.add_argument("--no-dashboard", action="store_true", help="Write JSON/CSV diagnostics without HTML")
+        reporter.add_argument("--benchmark", help="Observed reference stock in the supplied bars (evaluation only)")
+        reporter.add_argument("--risk-free-rate", type=float, default=0.0, help="Annual reference rate, evaluation only")
+        reporter.add_argument("--risk-lookback", type=int, default=60, help="Past return window for decision diagnostics")
+        reporter.add_argument("--risk-confidence", type=float, default=.95, help="Historical VaR/ES confidence")
+        reporter.add_argument("--risk-min-observations", type=int, default=20)
     action = sub.add_parser("act", help="Propose risk-checked dollar trading actions from current information")
     action.add_argument("--bars", required=True)
     action.add_argument("--events")
@@ -137,10 +152,21 @@ def main(argv=None):
         elif args.command == "fetch-alpaca-news":
             from .platforms import fetch_alpaca_news
             result = fetch_alpaca_news(tuple(args.symbols), args.start, args.end, args.output, timeout=args.timeout)
+        elif args.command == "report":
+            from .diagnostics import EvaluationConfig, regenerate_report
+            config = EvaluationConfig(risk_lookback=args.risk_lookback, risk_confidence=args.risk_confidence,
+                risk_min_observations=args.risk_min_observations, benchmark_symbol=args.benchmark,
+                risk_free_rate=args.risk_free_rate)
+            result = regenerate_report(args.bars, args.report, args.decisions, args.output,
+                                       config=config, dashboard=not args.no_dashboard)
         else:
             from .pipeline import act, evaluate, train, write_json
             symbols = tuple(args.symbols) if args.symbols else None
             if args.command == "demo":
+                from .diagnostics import EvaluationConfig
+                config = EvaluationConfig(risk_lookback=args.risk_lookback, risk_confidence=args.risk_confidence,
+                    risk_min_observations=args.risk_min_observations, benchmark_symbol=args.benchmark,
+                    risk_free_rate=args.risk_free_rate)
                 from .demo import generate_demo
                 output = Path(args.output)
                 data = generate_demo(output / "synthetic", frequency_seconds=args.frequency_seconds,
@@ -151,7 +177,8 @@ def main(argv=None):
                       risk_config=_risk_config(args.risk_config))
                 result = evaluate(data / "bars.csv", data / "events.jsonl", data / "trades.csv",
                                   output / "model/model.pt", output / "evaluation",
-                                  funding=args.funding, symbols=symbols)
+                                  funding=args.funding, symbols=symbols, evaluation_config=config,
+                                  dashboard=not args.no_dashboard)
                 result["demo_warning"] = "SYNTHETIC software validation only, not investment performance"
             elif args.command == "train":
                 result = train(args.bars, args.events, args.trades, args.output, epochs=args.epochs,
@@ -160,8 +187,13 @@ def main(argv=None):
                                risk_config=_risk_config(args.risk_config), episode_steps=args.episode_steps,
                                train_fraction=args.train_fraction, validation_fraction=args.validation_fraction)
             elif args.command == "evaluate":
+                from .diagnostics import EvaluationConfig
+                config = EvaluationConfig(risk_lookback=args.risk_lookback, risk_confidence=args.risk_confidence,
+                    risk_min_observations=args.risk_min_observations, benchmark_symbol=args.benchmark,
+                    risk_free_rate=args.risk_free_rate)
                 result = evaluate(args.bars, args.events, args.trades, args.checkpoint, args.output,
-                                  funding=args.funding, symbols=symbols)
+                                  funding=args.funding, symbols=symbols, evaluation_config=config,
+                                  dashboard=not args.no_dashboard)
             else:
                 holdings = _holdings(args.holdings)
                 if holdings and any(holdings.values()) and args.cash is None:

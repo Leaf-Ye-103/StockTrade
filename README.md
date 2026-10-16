@@ -55,7 +55,9 @@ Execution evaluation requires compatible **recorded trades**, including directio
 
 Training uses chronological 70% training, 15% validation and 15% held-out partitions by default, with bounded training episodes starting from fresh funding. Training chunks have the same configured bar count (128 by default, reduced if the training prefix is shorter); an incomplete final chunk is left unused. The final bar values the account; it opens no new order. Preprocessing learns only from the training prefix. Validation selects the highest terminal wealth among admissible checkpoints over the same period; held-out evaluation never updates weights.
 
-Keep `model.info.json` beside `model.pt`. Training writes `training.json` and `training_decisions.jsonl`; evaluation writes `report.json` and `decisions.jsonl`. Forecast and earlier action-reward checkpoints must be retrained in the new `direct_wealth_policy` format.
+Keep `model.info.json` beside `model.pt`. Training writes `training.json` and `training_decisions.jsonl`. Evaluation writes `report.json`, annotated `decisions.jsonl`, `diagnostics.json`, `decision_risk.csv` and a standalone interactive `dashboard.html`. Open the HTML file locally to inspect candles, every decision, account valuations, risk and metrics. `--no-dashboard` retains JSON/CSV without HTML. Forecast and earlier action-reward checkpoints must be retrained in the new `direct_wealth_policy` format.
+
+Risk diagnostics include historical VaR/expected shortfall in dollars, volatility, exposure, stress scenarios and separate estimated costs before and after feasible proposals, including the portfolio risk of holding. These estimates use past observations and remain separate from training and hard constraints. Missing inputs produce unavailable values with reasons. See [evaluation and reports](docs/evaluation.md) for assumptions, benchmark comparisons and report regeneration.
 
 ## Information collection and platforms
 
@@ -91,5 +93,9 @@ See [architecture](docs/architecture.md), [data formats and collection configura
 | [Execution](src/stocktrade/execution.py) | Observed matches and conditional account ledger. |
 | [Objective](src/stocktrade/objective.py) | Terminal net wealth and separate episode feasibility. |
 | [Workflow](src/stocktrade/pipeline.py) | Chronological episodes, training and checkpoint/report provenance. |
+| [Decision risk](src/stocktrade/decision_risk.py) | Past-only current/projected portfolio diagnostics, including holds. |
+| [Analytics](src/stocktrade/analytics.py) | Evaluation risk, performance, benchmark and market indicators. |
+| [Visualization](src/stocktrade/visualization.py) | Standalone interactive HTML reports from auditable observations. |
+| [Report orchestration](src/stocktrade/diagnostics.py) | Annotated report artifacts and regeneration from archived evidence. |
 
 No financial edge has been demonstrated. Realistic performance claims require licensed historical observations, adequate execution coverage and independent evaluation across market regimes.

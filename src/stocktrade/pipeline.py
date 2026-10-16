@@ -315,7 +315,8 @@ def _load_checkpoint(checkpoint):
     return agent, metadata
 
 
-def evaluate(bars_path, events_path, trades_path, checkpoint, output, *, funding=None, symbols=None):
+def evaluate(bars_path, events_path, trades_path, checkpoint, output, *, funding=None, symbols=None,
+             evaluation_config=None, dashboard=True):
     agent, metadata = _load_checkpoint(checkpoint)
     funding = _funding(metadata["initial_funding"] if funding is None else funding)
     allowed = _symbols(symbols, set(agent.universe))
@@ -339,14 +340,15 @@ def evaluate(bars_path, events_path, trades_path, checkpoint, output, *, funding
         bars_sha256=file_signature(bars_path), trades_sha256=file_signature(trades_path),
         events_sha256=file_signature(events_path) if events_path else None,
         risk_config=asdict(risk), selected_epoch=metadata["selected_epoch"])
-    output = Path(output)
-    output.mkdir(parents=True, exist_ok=True)
     records = report.pop("decision_records")
-    write_json(output / "report.json", report)
-    with (output / "decisions.jsonl").open("w") as handle:
-        for record in records:
-            handle.write(json.dumps(record, default=_json_default, allow_nan=False) + "\n")
-    return report
+    # Only frozen held-out decisions enter diagnostics. Training/validation and
+    # checkpoint selection never call the evaluation reporting modules.
+    from .diagnostics import EvaluationConfig, include_benchmark, write_evaluation_artifacts
+    config = evaluation_config or EvaluationConfig()
+    diagnostic_bars = include_benchmark(bars_path, bars, config.benchmark_symbol)
+    return write_evaluation_artifacts(bars=diagnostic_bars, records=records, report=report,
+        output=output, start=boundary, stop=len(frames[agent.universe[0]].timestamps),
+        risk_config=risk, config=config, dashboard=dashboard)
 
 
 def _fresh_market(timestamp, now, maximum_age):
@@ -409,10 +411,16 @@ def act(bars_path, events_path, checkpoint, *, funding=None, symbols=None, cash=
     if decision.accepted and decision.quantity:
         actions.append(dict(side=sample.action.side, symbol=sample.action.symbol,
                             value=decision.notional, quantity=decision.quantity))
-    return dict(timestamp=decision_timestamp, market_timestamp=market_timestamp, total_funding=funding,
+    result = dict(timestamp=decision_timestamp, market_timestamp=market_timestamp, total_funding=funding,
         available_cash=state.cash, equity=state.equity, allowed_symbols=list(allowed),
         policy_action=asdict(sample.action), trading_actions=actions, risk_decision=asdict(decision),
         information_collection=collection_report, online=bool(collect),
         risk_history_status="missing" if history_missing else "new_account" if new_account else "provided",
         account_risk_baselines=dict(peak_equity=state.peak_equity, day_start_equity=state.day_start_equity),
         execution_status="Proposal only; no broker order or unsupported historical fill")
+    from .decision_risk import estimate_decision_risk
+    result["risk_estimate"] = estimate_decision_risk(bars=bars,
+        record=dict(timestamp=decision_timestamp, bar_index=index, policy_action=asdict(sample.action),
+            feasibility=asdict(decision), account_before=dict(equity=state.equity, cash=state.cash,
+                holdings=dict(state.holdings))), risk_config=RiskConfig(**metadata["risk_config"]))
+    return result

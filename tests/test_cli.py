@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 from stocktrade import collection, demo, pipeline, platforms
+from stocktrade.diagnostics import EvaluationConfig
 from stocktrade.cli import main
 from stocktrade.risk import RiskConfig
 
@@ -91,6 +92,7 @@ def test_evaluation_passes_funding_and_summarizes_large_evidence(workflows, caps
     ]) == 0
     workflows["evaluate"].assert_called_once_with(
         "bars.csv", None, "trades.csv", "model.pt", "evaluation", funding=5000.0, symbols=("NVDA",),
+        evaluation_config=EvaluationConfig(), dashboard=True,
     )
     report = json.loads(capsys.readouterr().out)
     assert report["execution"] == {"total_fees": .1}
@@ -209,6 +211,7 @@ def test_demo_shares_funding_and_universe_between_training_and_evaluation(
     workflows["evaluate"].assert_called_once_with(
         data / "bars.csv", data / "events.jsonl", data / "trades.csv",
         tmp_path / "model/model.pt", tmp_path / "evaluation", funding=2500.0, symbols=("NVDA", "MSFT"),
+        evaluation_config=EvaluationConfig(), dashboard=True,
     )
     report = json.loads(capsys.readouterr().out)
     assert "SYNTHETIC" in report["demo_warning"]

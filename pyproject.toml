@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stocktrade-research"
-version = "0.3.0"
+version = "0.4.0"
 description = "Time-safe online information and portfolio policies optimizing net wealth under risk limits"
 requires-python = ">=3.11"
-dependencies = ["numpy>=1.26,<3", "torch>=2.5,<3", "defusedxml>=0.7,<1"]
+dependencies = ["numpy>=1.26,<3", "torch>=2.5,<3", "defusedxml>=0.7,<1", "plotly>=6.3,<7"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "ruff>=0.9,<1"]

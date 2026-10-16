@@ -59,6 +59,12 @@ Read terminal wealth together with:
 - Results by stock/regime and sensitivity to latency, costs and matching tolerances.
 - Source availability, expiry, missing features, collector failures and historical provenance.
 
+Evaluation also records historical risk diagnostics for every decision, including holds. Current and projected portfolio VaR/expected shortfall, volatility, concentration and hypothetical stress scenarios use past observations; a feasible proposal's projected risk remains conditional, even if execution later proves unsupported. Estimated commission/spread/slippage costs remain informational and are not extra ledger charges or policy rewards.
+
+The interactive dashboard and JSON/CSV artifacts expose those estimates alongside decisions and execution evidence. Missing data and inadequate samples produce unavailable values with reasons. Optional benchmark comparisons use observed aligned prices as an unexecuted reference; they do not assume an alternative filled strategy. Annualized metrics require defensible sampling and sufficient history. The report does not treat each minute or second as a trading day. See [evaluation diagnostics](evaluation.md).
+
+These diagnostics do not change terminal-wealth learning, hard constraints or checkpoint selection. Selecting models repeatedly after inspecting test charts would still contaminate the held-out test, even though report generation itself performs no learning. Historical VaR, expected shortfall and stress scenarios cannot cover every possible loss or an unobserved queue/impact effect.
+
 Taxes, settlement, financing, dividends and all venue charges are outside the current ledger convention unless explicitly added. Endpoint marks are valuations, not evidence of an executable liquidation. Hard constraints cannot guarantee safety during halts, discontinuities, correlated losses or operational failures.
 
 The synthetic demo validates software integration and input frequency handling. Its records cannot establish profitability, predictive skill, liquidity realism or generalized learning.

@@ -19,3 +19,5 @@ pluggy==1.6.0
 packaging==26.3
 pygments==2.21.0
 defusedxml==0.7.1
+plotly==6.3.1
+narwhals==2.8.0

@@ -16,6 +16,10 @@ flowchart LR
     X --> P[Cash/holdings ledger]
     P --> V[Final net wealth and episode feasibility]
     V -->|Admissible training episodes only| M
+    R --> D[Evaluation-only historical risk diagnostics]
+    P --> D
+    D --> H[Interactive report and JSON/CSV audit]
+    P --> H
 ```
 
 ## Time and information boundaries
@@ -61,6 +65,14 @@ After a latency-adjusted arrival, the matcher searches a bounded subsequent inte
 The CLI requires exact quantity. The lower-level matching API can allow a smaller near-size analog and retains its actual quantity. No compatible event means abstention and an unchanged account, not a close-price fill. Reports retain unsupported intentions, source IDs and coverage. Incomplete evidence makes an episode ineligible to teach terminal wealth as though its intended strategy were observed.
 
 The ledger is conditional on historical analogs. It cannot reveal where an added order would enter the queue, which orders it would displace or how other traders would respond. Causal market impact requires a separate structural model and sufficient order lifecycle evidence.
+
+## Evaluation diagnostics and visualization
+
+The evaluation reporting branch estimates current and conditionally projected portfolio risk from past observations. It includes existing holdings during holds and rejected proposals, rather than treating no new order as no risk. Feasible proposal projections use executable quote cash movement and current close marks; they do not become account transitions until compatible observed execution evidence is accepted.
+
+`decision_risk.py` supplies historical dollar VaR/expected shortfall, one-interval volatility, exposure, stress and separate cost estimates. `analytics.py` summarizes evaluation performance, risk, a requested price-only benchmark and technical indicators. `visualization.py` renders the audit as a standalone interactive HTML dashboard with market data, every decision, portfolio and risk views. Missing or insufficient observations remain unavailable with reasons, and unsuitable intraday samples do not receive invented annualized statistics.
+
+These diagnostics do not feed the model, add penalties to terminal wealth, alter hard risk checks or rank checkpoints. Report regeneration uses archived actions and evidence without rerunning the policy. See [evaluation and reports](evaluation.md) for CLI use, output artifacts and interpretation.
 
 ## Source and extension contracts
 

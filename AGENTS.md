@@ -39,3 +39,11 @@ executable strategy returns. Report unmatched intentions and selection bias.
 Do not commit market datasets, checkpoints, credentials or generated reports.
 Keep them under ignored data/ or runs/. Test fixtures are explicitly synthetic.
 No broker order endpoint or live trading is implemented.
+
+Evaluation diagnostics and interactive reports are separate from learning.
+Historical VaR/ES, stress scenarios, technical indicators, projected risk and
+estimated costs must not enter the objective, alter hard constraints or rank
+checkpoints. Include the existing portfolio's risk for holds; distinguish a
+conditional feasible proposal from observed analog accounting. Preserve
+unavailable values with reasons and do not annualize intraday rows as days.
+Report regeneration must preserve original audits and never invent fills.
